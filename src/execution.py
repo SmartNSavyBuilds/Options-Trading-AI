@@ -714,11 +714,14 @@ def update_exit_recommendations_after_execution(results: pd.DataFrame) -> None:
         recommendations['order_status'] = 'monitor'
     if 'last_submitted_at' not in recommendations.columns:
         recommendations['last_submitted_at'] = ''
+    # ensure string columns stay object dtype so datetime strings can be written
+    recommendations['last_submitted_at'] = recommendations['last_submitted_at'].astype(object)
+    recommendations['order_status'] = recommendations['order_status'].astype(object)
 
     for _, result in results.iterrows():
         ticker = str(result.get('ticker', '')).upper()
         status = str(result.get('status', '')).strip().lower()
-        submitted_at = result.get('submitted_at_utc', '')
+        submitted_at = str(result.get('submitted_at_utc', ''))
         mask = recommendations['symbol'].astype(str).str.upper() == ticker
         if not mask.any():
             continue

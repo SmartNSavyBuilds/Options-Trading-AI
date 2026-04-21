@@ -3,7 +3,7 @@ from __future__ import annotations
 from src.execution import (
     TradingConfig,
     append_execution_log,
-    run_execution_cycle,
+    run_option_execution_cycle,
     save_execution_preview,
     sync_broker_state,
 )
@@ -12,7 +12,12 @@ from src.execution import (
 def main() -> None:
     config = TradingConfig.from_env()
     account, positions = sync_broker_state(config)
-    preview, results = run_execution_cycle(config)
+    # Route through real options contracts (single-leg, chosen by the signal's
+    # bias and strike hint). This replaces the old proxy-equity path so Alpaca
+    # receives actual OCC option symbols instead of the underlying stock ticker.
+    # max_days=35 aligns with the scorer's ~24-day expiry recommendations.
+    # top_n=5 allows up to 5 new positions per cycle.
+    preview, results = run_option_execution_cycle(config, max_days=35, top_n=5)
 
     if preview.empty:
         print('No execution candidates are available. Generate signals and the paper-trade queue first.')

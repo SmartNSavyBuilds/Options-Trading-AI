@@ -1,61 +1,45 @@
 # Setup Windows Task Scheduler entries for the Options Trading AI system.
-# Registers two tasks:
-#   OptionsMonitor   - market_monitor.py --loop (scoring + execution)
-#   OptionsDashboard - streamlit dashboard on port 8501
-#
-# Run this script ONCE as Administrator to register/update both tasks.
-# After that, both start automatically at every logon.
+# Uses schtasks.exe directly to avoid PowerShell cmdlet hangs.
+# Run this script ONCE as Administrator.
 
+$workingDir = "c:\claw-code\projects\options_trading_ai"
 $pythonExe  = "c:\claw-code\.venv\Scripts\python.exe"
 $streamlit  = "c:\claw-code\.venv\Scripts\streamlit.exe"
-$workingDir = "c:\claw-code\projects\options_trading_ai"
-
-$taskSettings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
-    -RestartCount 5 `
-    -RestartInterval (New-TimeSpan -Minutes 2) `
-    -StartWhenAvailable `
-    -RunOnlyIfNetworkAvailable
 
 # --- 1. Monitor loop ---
-$monitorAction = New-ScheduledTaskAction `
-    -Execute $pythonExe `
-    -Argument "market_monitor.py --loop --interval-seconds 900" `
-    -WorkingDirectory $workingDir
-
-$monitorTrigger = New-ScheduledTaskTrigger -AtLogOn
-
-Register-ScheduledTask `
-    -TaskName  "OptionsMonitor" `
-    -Action    $monitorAction `
-    -Trigger   $monitorTrigger `
-    -Settings  $taskSettings `
-    -RunLevel  Highest `
-    -Force | Out-Null
-
-Write-Host "OK - Task 'OptionsMonitor' registered (starts at logon)."
+$monitorCmd = "`"$pythonExe`" market_monitor.py --loop --interval-seconds 900"
+schtasks /Create /F /TN "OptionsMonitor" /TR $monitorCmd /SC ONLOGON /RL HIGHEST /IT
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "OK - OptionsMonitor task registered."
+} else {
+    Write-Host "ERROR - OptionsMonitor failed to register (code $LASTEXITCODE)."
+}
 
 # --- 2. Dashboard ---
-$dashboardAction = New-ScheduledTaskAction `
-    -Execute $streamlit `
-    -Argument "run dashboard.py --server.port 8501 --server.headless true" `
-    -WorkingDirectory $workingDir
+$dashCmd = "`"$streamlit`" run dashboard.py --server.port 8501 --server.headless true"
+schtasks /Create /F /TN "OptionsDashboard" /TR $dashCmd /SC ONLOGON /RL HIGHEST /IT
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "OK - OptionsDashboard task registered."
+} else {
+    Write-Host "ERROR - OptionsDashboard failed to register (code $LASTEXITCODE)."
+}
 
-$dashboardTrigger = New-ScheduledTaskTrigger -AtLogOn
+# Set working directory for both tasks via XML patch
+foreach ($task in @("OptionsMonitor", "OptionsDashboard")) {
+    $xml = schtasks /Query /TN $task /XML ONE 2>$null
+    if ($xml) {
+        $xml = $xml -replace "<WorkingDirectory>.*?</WorkingDirectory>", ""
+        $xml = $xml -replace "(<Command>)", "<WorkingDirectory>$workingDir</WorkingDirectory>`$1"
+        $tmpFile = "$env:TEMP\$task.xml"
+        $xml | Set-Content -Encoding Unicode $tmpFile
+        schtasks /Create /F /TN $task /XML $tmpFile | Out-Null
+        Remove-Item $tmpFile -ErrorAction SilentlyContinue
+        Write-Host "OK - Working directory set for $task."
+    }
+}
 
-Register-ScheduledTask `
-    -TaskName  "OptionsDashboard" `
-    -Action    $dashboardAction `
-    -Trigger   $dashboardTrigger `
-    -Settings  $taskSettings `
-    -RunLevel  Highest `
-    -Force | Out-Null
-
-Write-Host "OK - Task 'OptionsDashboard' registered (starts at logon, http://localhost:8501)."
 Write-Host ""
-Write-Host "To start both NOW without rebooting:"
-Write-Host "  Start-ScheduledTask -TaskName OptionsMonitor"
-Write-Host "  Start-ScheduledTask -TaskName OptionsDashboard"
-Write-Host ""
-Write-Host "To check status:"
-Write-Host "  Get-ScheduledTask -TaskName OptionsMonitor,OptionsDashboard | Select TaskName, State"
+Write-Host "Done. Both tasks will start automatically at next logon."
+Write-Host "To start them NOW run:"
+Write-Host "  schtasks /Run /TN OptionsMonitor"
+Write-Host "  schtasks /Run /TN OptionsDashboard"

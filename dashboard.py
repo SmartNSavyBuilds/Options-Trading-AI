@@ -948,7 +948,7 @@ with st.expander('How to use this dashboard'):
     )
     st.write(f'Current paper portfolio P&L snapshot: ${total_unrealized_pl:,.2f}')
 
-overview_tab, radar_tab, risk_tab, advisor_tab, congress_tab, news_tab, auto_tab = st.tabs(['Command Center', 'Opportunity Radar', 'Risk Lab', 'Advisor', 'Congress', '📰 News', 'Execution Desk'])
+overview_tab, radar_tab, risk_tab, advisor_tab, congress_tab, news_tab, auto_tab, account_tab = st.tabs(['Command Center', 'Opportunity Radar', 'Risk Lab', 'Advisor', 'Congress', '📰 News', 'Execution Desk', '📊 Live Account'])
 
 with overview_tab:
     left, right = st.columns([1.5, 1])
@@ -1894,3 +1894,134 @@ with auto_tab:
         '**Current implementation:** the system uses safe proxy equity orders in paper mode so the execution layer can be validated now and later swapped toward real options routing.\n\n'
         '**Also worth considering:** QuantConnect Lean for research-to-live workflow, Interactive Brokers for deeper production brokerage depth, and Tradier if you want a more options-centric retail API path.'
     )
+
+with account_tab:
+    st.subheader('Live Account — Alpaca Paper')
+
+    # ── Top KPI row ──────────────────────────────────────────────────────────
+    if not broker_account_status.empty:
+        acct = broker_account_status.iloc[0]
+        equity_val      = float(acct.get('equity', 0.0) or 0.0)
+        cash_val        = float(acct.get('cash', 0.0) or 0.0)
+        port_val        = float(acct.get('portfolio_value', 0.0) or 0.0)
+        opt_bp          = float(acct.get('options_buying_power', 0.0) or 0.0)
+        mkt_status      = str(acct.get('market_status', 'unknown')).title()
+        conn_status     = str(acct.get('connection_status', 'unknown')).replace('_', ' ').title()
+    else:
+        equity_val = cash_val = port_val = opt_bp = 0.0
+        mkt_status = conn_status = 'N/A'
+
+    total_pl   = float(broker_positions['unrealized_pl'].apply(pd.to_numeric, errors='coerce').sum()) if not broker_positions.empty else 0.0
+    winners    = int((broker_positions['unrealized_pl'].apply(pd.to_numeric, errors='coerce') > 0).sum()) if not broker_positions.empty else 0
+    losers     = int((broker_positions['unrealized_pl'].apply(pd.to_numeric, errors='coerce') < 0).sum()) if not broker_positions.empty else 0
+    total_pos  = winners + losers
+    win_rate   = f"{100 * winners / total_pos:.0f}%" if total_pos > 0 else 'N/A'
+    pl_delta   = f"{'▲' if total_pl >= 0 else '▼'} ${abs(total_pl):,.2f}"
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric('Portfolio Value',    f'${port_val:,.0f}')
+    k2.metric('Equity',             f'${equity_val:,.0f}')
+    k3.metric('Cash',               f'${cash_val:,.0f}')
+    k4.metric('Unrealized P&L',     pl_delta)
+    k5.metric('Win Rate',           win_rate, help=f'{winners} winners / {losers} losers')
+    k6.metric('Market',             mkt_status)
+
+    st.caption(f'Broker: Alpaca paper  |  Connection: {conn_status}  |  Options buying power: ${opt_bp:,.0f}  |  Options level: {int(broker_account_status.iloc[0].get("options_approved_level", 0) or 0) if not broker_account_status.empty else 0}')
+    st.divider()
+
+    # ── Split positions: options vs stocks ───────────────────────────────────
+    if not broker_positions.empty:
+        pos = broker_positions.copy()
+        pos['unrealized_pl'] = pd.to_numeric(pos['unrealized_pl'], errors='coerce').fillna(0.0)
+        pos['market_value']  = pd.to_numeric(pos['market_value'],  errors='coerce').fillna(0.0)
+        pos['qty']           = pd.to_numeric(pos['qty'],           errors='coerce').fillna(0.0)
+        pos['pl_pct']        = (pos['unrealized_pl'] / (pos['market_value'] - pos['unrealized_pl'])).replace([float('inf'), float('-inf')], 0.0).fillna(0.0) * 100
+        # detect options by OCC symbol pattern (has digits + C/P + digits)
+        import re as _re
+        pos['is_option'] = pos['symbol'].apply(lambda s: bool(_re.search(r'\d[CP]\d', str(s))))
+        options_pos = pos[pos['is_option']].copy()
+        stocks_pos  = pos[~pos['is_option']].copy()
+
+        opt_col, stock_col = st.columns(2)
+
+        with opt_col:
+            st.subheader(f'Options Positions ({len(options_pos)})')
+            if options_pos.empty:
+                st.info('No open options positions.')
+            else:
+                display_opts = options_pos[['symbol', 'qty', 'market_value', 'unrealized_pl', 'pl_pct']].rename(columns={
+                    'symbol': 'Contract', 'qty': 'Qty', 'market_value': 'Mkt Value ($)',
+                    'unrealized_pl': 'Unrealized P&L ($)', 'pl_pct': 'P&L %',
+                })
+                st.dataframe(
+                    display_opts.style.applymap(
+                        lambda v: 'color: #4ade80' if isinstance(v, (int, float)) and v > 0 else ('color: #f87171' if isinstance(v, (int, float)) and v < 0 else ''),
+                        subset=['Unrealized P&L ($)', 'P&L %'],
+                    ).format({'Mkt Value ($)': '${:,.2f}', 'Unrealized P&L ($)': '${:,.2f}', 'P&L %': '{:.1f}%'}),
+                    use_container_width=True, hide_index=True,
+                )
+                opts_pl = float(options_pos['unrealized_pl'].sum())
+                st.caption(f'Options P&L: {"▲" if opts_pl >= 0 else "▼"} ${abs(opts_pl):,.2f}')
+
+        with stock_col:
+            st.subheader(f'Stock Positions ({len(stocks_pos)})')
+            if stocks_pos.empty:
+                st.info('No open stock positions.')
+            else:
+                display_stk = stocks_pos[['symbol', 'qty', 'market_value', 'unrealized_pl', 'pl_pct']].rename(columns={
+                    'symbol': 'Ticker', 'qty': 'Shares', 'market_value': 'Mkt Value ($)',
+                    'unrealized_pl': 'Unrealized P&L ($)', 'pl_pct': 'P&L %',
+                })
+                st.dataframe(
+                    display_stk.style.applymap(
+                        lambda v: 'color: #4ade80' if isinstance(v, (int, float)) and v > 0 else ('color: #f87171' if isinstance(v, (int, float)) and v < 0 else ''),
+                        subset=['Unrealized P&L ($)', 'P&L %'],
+                    ).format({'Mkt Value ($)': '${:,.2f}', 'Unrealized P&L ($)': '${:,.2f}', 'P&L %': '{:.1f}%'}),
+                    use_container_width=True, hide_index=True,
+                )
+                stk_pl = float(stocks_pos['unrealized_pl'].sum())
+                st.caption(f'Stocks P&L: {"▲" if stk_pl >= 0 else "▼"} ${abs(stk_pl):,.2f}')
+
+        st.divider()
+
+        # ── P&L bar chart across all positions ───────────────────────────────
+        st.subheader('P&L by Position')
+        pl_chart = px.bar(
+            pos.sort_values('unrealized_pl'),
+            x='symbol', y='unrealized_pl',
+            color='unrealized_pl',
+            color_continuous_scale=['#f87171', '#94a3b8', '#4ade80'],
+            color_continuous_midpoint=0,
+            labels={'symbol': 'Symbol', 'unrealized_pl': 'Unrealized P&L ($)'},
+            text='unrealized_pl',
+        )
+        pl_chart.update_traces(texttemplate='$%{text:.0f}', textposition='outside', textfont=dict(color='#e2e8f0'))
+        pl_chart.update_coloraxes(showscale=False)
+        chart_template(pl_chart).update_layout(height=380, showlegend=False)
+        st.plotly_chart(pl_chart, use_container_width=True)
+
+    else:
+        st.info('No positions synced yet. The monitor loop will populate this after the next cycle.')
+
+    st.divider()
+
+    # ── Recent orders ────────────────────────────────────────────────────────
+    st.subheader('Recent Broker Orders')
+    if broker_orders.empty:
+        st.info('No broker orders synced yet.')
+    else:
+        orders_display = broker_orders.copy()
+        orders_display['submitted_at'] = pd.to_datetime(orders_display.get('submitted_at', ''), errors='coerce').dt.strftime('%m/%d %H:%M')
+        orders_display = orders_display[['symbol', 'side', 'qty', 'status', 'submitted_at']].rename(columns={
+            'symbol': 'Symbol', 'side': 'Side', 'qty': 'Qty', 'status': 'Status', 'submitted_at': 'Submitted (UTC)',
+        })
+        filled_mask  = orders_display['Status'].str.lower() == 'filled'
+        accepted_mask = orders_display['Status'].str.lower() == 'accepted'
+        st.dataframe(
+            orders_display.style.applymap(
+                lambda v: 'color: #4ade80' if str(v).lower() in {'filled'} else ('color: #60a5fa' if str(v).lower() == 'accepted' else ''),
+                subset=['Status'],
+            ),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption(f"{int(filled_mask.sum())} filled  |  {int(accepted_mask.sum())} accepted  |  {len(orders_display)} total shown")

@@ -1954,7 +1954,7 @@ with account_tab:
                     'unrealized_pl': 'Unrealized P&L ($)', 'pl_pct': 'P&L %',
                 })
                 st.dataframe(
-                    display_opts.style.applymap(
+                    display_opts.style.map(
                         lambda v: 'color: #4ade80' if isinstance(v, (int, float)) and v > 0 else ('color: #f87171' if isinstance(v, (int, float)) and v < 0 else ''),
                         subset=['Unrealized P&L ($)', 'P&L %'],
                     ).format({'Mkt Value ($)': '${:,.2f}', 'Unrealized P&L ($)': '${:,.2f}', 'P&L %': '{:.1f}%'}),
@@ -1973,7 +1973,7 @@ with account_tab:
                     'unrealized_pl': 'Unrealized P&L ($)', 'pl_pct': 'P&L %',
                 })
                 st.dataframe(
-                    display_stk.style.applymap(
+                    display_stk.style.map(
                         lambda v: 'color: #4ade80' if isinstance(v, (int, float)) and v > 0 else ('color: #f87171' if isinstance(v, (int, float)) and v < 0 else ''),
                         subset=['Unrealized P&L ($)', 'P&L %'],
                     ).format({'Mkt Value ($)': '${:,.2f}', 'Unrealized P&L ($)': '${:,.2f}', 'P&L %': '{:.1f}%'}),
@@ -2018,7 +2018,7 @@ with account_tab:
         filled_mask  = orders_display['Status'].str.lower() == 'filled'
         accepted_mask = orders_display['Status'].str.lower() == 'accepted'
         st.dataframe(
-            orders_display.style.applymap(
+            orders_display.style.map(
                 lambda v: 'color: #4ade80' if str(v).lower() in {'filled'} else ('color: #60a5fa' if str(v).lower() == 'accepted' else ''),
                 subset=['Status'],
             ),

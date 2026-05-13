@@ -204,7 +204,21 @@ To begin, the system needs to do three things well:
 
 ## Latest Additions
 
-New additions now included in the project:
+### May 2026 Updates
+- daily control audit added covering monitor staleness, performance staleness, execution error rate, protective exit fill rate, and concentration breaches
+- automatic queue hold logic that blocks new entries when concentration or control checks fail
+- control audit snapshots written to CSV on every run with a running history log
+- Windows Task Scheduler integration for fully automated daily audit execution
+- Claude AI advisory layer integrated for trade commentary, thesis summaries, and operator guidance on candidate setups
+- ecommerce automation engine built with Shopify and TikTok API integration, automating product catalog sync, trend matching, keyword indexing, and performance reporting across 1,000+ SKUs
+- portfolio daily checks CSV added for tracking equity, exposure, and control state over time
+- alerts feed expanded to capture concentration breaches and stale monitor events automatically
+- paper trade queue enhanced with guardrail status, sector exposure tracking, correlation bucket tracking, and approval state columns
+
+
+### Earlier Additions
+
+Previous additions included in the project:
 - an options candidate file with projected cost, projected profit, and projected return percentage
 - a sizing hint that estimates how much of risk capital to allocate to each idea
 - a professional dashboard refresh with risk, radar, and autonomy views
@@ -228,6 +242,16 @@ New additions now included in the project:
 - a structured mathematical learning guide for deeper study
 
 ## Project Update Log
+
+### 2026-05-13
+- daily control audit script created with automated staleness detection and concentration breach checking
+- queue auto-hold logic added so new entries are blocked when risk controls are breached
+- Windows scheduled task created for daily automated control check execution
+- Claude AI advisory integration added for trade commentary and operator guidance
+- ecommerce engine built with Shopify and TikTok APIs for catalog sync and trend matching
+- portfolio daily checks CSV and control audit history CSV added to output layer
+- alerts feed expanded to capture control misses and concentration breaches automatically
+- paper trade queue enhanced with sector exposure, correlation bucket, and guardrail status tracking
 
 ### 2026-04-16
 - signal scanner created

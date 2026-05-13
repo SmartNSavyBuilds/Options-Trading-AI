@@ -45,28 +45,20 @@ This project runs a continuous autonomous pipeline that:
 ---
 
 ## Architecture
+```text
+Signal Engine -> Opportunity Ranking -> Paper Trade Queue -> Guardrail Checks -> Broker Submit (paper)
+                                              |                 |
+                                              |                 +-> Auto-hold when concentration or control checks fail
+                                              |
+                                              +-> Daily Control Audit -> Alerts Feed -> Dashboard (Execution Desk)
 
-```
-options_trading_ai/
-├── market_monitor.py          # Autonomous loop — runs every 15 min
-├── app.py                     # Signal scanner entry point
-├── discover_opportunities.py  # Broader opportunity sourcing
-├── evaluate_exit_rules.py     # Exit threshold evaluation
-├── execute_exit_trades.py     # Autonomous exit execution
-├── execute_paper_trades.py    # Autonomous entry execution
-├── paper_trade.py             # Queue builder with guardrails
-├── performance_journal.py     # Open position tracking
-├── dashboard.py               # Streamlit research dashboard
-├── src/
-│   ├── signal_engine.py       # RSI, momentum, trend, volume scoring
-│   ├── exit_manager.py        # Exit rule logic and option metadata parsing
-│   ├── execution.py           # Broker-safe execution layer (paper-first)
-│   ├── options_selector.py    # Expiration targeting and structure selection
-│   ├── risk_guardrails.py     # Exposure, sector, and stress test controls
-│   ├── performance_journal.py # Journal generation and strategy attribution
-│   └── ...
-└── tests/
-    └── test_trading_enhancements.py  # 39 unit tests
+Core runtime components:
+- app.py and scanner modules: signal generation and ranking
+- paper_trade.py: queue construction with exposure, sector, and correlation guardrails
+- execute_paper_trades.py and src/execution.py: paper broker routing and state reconciliation
+- daily_control_check.py: monitor staleness checks, concentration checks, control miss tracking, queue hold enforcement
+- dashboard.py: command center, risk lab, and execution monitoring panels
+- outputs/*.csv: audit logs, queue state, broker state, and performance summaries
 ```
 
 ---
@@ -140,8 +132,15 @@ python -m pytest tests/ -v
 ---
 
 ## Paper Trading Status
+This system is running in **active paper-trading operations mode** with live broker sync and automated control oversight.
 
-This system is currently in **paper trading mode** accumulating forward performance data across multiple market regimes. Live deployment will only be considered after sufficient paper trade history validates signal expectancy and drawdown characteristics.
+Current operating posture:
+- daily control audits are running and writing audit snapshots to the output layer
+- concentration and control misses can automatically block new queue submissions
+- monitor and performance staleness are tracked explicitly before execution decisions
+- execution and queue state are visible through the dashboard and audit feeds
+
+Live deployment remains gated. Promotion beyond paper mode still requires a larger forward track record with stable expectancy, controlled drawdowns, and verified execution quality across multiple market regimes.
 
 ---
 
@@ -353,26 +352,25 @@ An AI system can outperform that process by:
 ---
 
 ## Honest Competitive Analysis
+Short answer: **strong independent system, still not hedge-fund level**.
 
-Short answer: **not yet at hedge-fund level**, and saying otherwise would be misleading.
-
-This system is becoming a strong independent trading and research desk, but it does **not** currently match what established hedge funds or elite quant firms operate with. Those firms have larger research teams, deeper data access, stronger execution infrastructure, better slippage modeling, tighter portfolio construction, and formal risk and compliance layers.
+The project has moved beyond early prototype status and now behaves more like a disciplined paper-trading operations desk. It includes live broker sync, structured queue guardrails, daily control auditing, automated hold logic for concentration and control misses, and auditable execution and monitoring outputs.
 
 ### What this build can realistically compete with today
-- many discretionary retail workflows on consistency and speed
-- a solo trader or small-team research process
-- junior-analyst style screening, monitoring, and idea organization
-- paper-trading operations where discipline matters more than raw infrastructure
+- many discretionary retail workflows on discipline, process consistency, and operational visibility
+- solo trader or small-team research operations that need repeatable execution with risk gating
+- junior-analyst style screening, monitoring, and workflow automation
+- paper-first autonomous trading workflows where controls and auditability matter as much as raw signal generation
 
 ### What it still needs before it can approach professional quant quality
-- long out-of-sample forward performance, not just good-looking signals
-- stronger portfolio optimization and exposure controls
-- better transaction cost and fill-quality modeling
-- richer data coverage, including options microstructure and event data
-- production monitoring, deployment, audit, and compliance workflows
-- narrower strategy specialization instead of trying to beat every market regime at once
+- longer out-of-sample forward performance across multiple market regimes
+- stronger portfolio-level optimization and adaptive capital allocation
+- deeper fill-quality, slippage, and transaction-cost modeling for options execution
+- richer options microstructure and event-driven data coverage
+- production-grade reliability, alerting, governance, and compliance workflows for live capital
+- tighter strategy specialization with clear retirement rules for weak setup families
 
-The honest position is this: the project can become **very useful and commercially credible** as a disciplined retail or boutique research platform well before it becomes a true hedge-fund competitor.
+The honest position is this: the system is now **commercially credible as a disciplined, paper-first research and execution platform**, but it still needs longer validated evidence and stronger execution modeling before any claim of institutional parity would be justified.
 
 ## Core Idea
 

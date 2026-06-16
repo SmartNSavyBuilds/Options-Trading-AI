@@ -1,0 +1,24 @@
+services:
+  options-gateway:
+    ports: []
+
+  options-proxy:
+    image: caddy:2
+    container_name: options-proxy
+    depends_on:
+      options-gateway:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

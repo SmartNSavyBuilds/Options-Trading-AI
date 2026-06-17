@@ -1,8 +1,12 @@
 import os
 import re
+import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Ensure src modules can be imported
+sys.path.insert(0, str(Path(__file__).parent))
 
 import pandas as pd
 import plotly.express as px
@@ -11,11 +15,42 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-from src.congressional_disclosures import build_public_interest_watchlist, build_recent_large_trades
-from src.execution import TradingConfig
-from src.multi_asset import build_crypto_watchlist, build_market_regime_summary
-from src.performance_journal import add_execution_status_to_candidates, build_open_trade_timeline, humanize_display_text
-from src.risk_guardrails import build_exposure_summary, build_risk_overview, build_stress_test_table
+try:
+    from src.congressional_disclosures import build_public_interest_watchlist, build_recent_large_trades
+except ImportError as e:
+    st.error(f'Error importing congressional_disclosures: {e}')
+    build_public_interest_watchlist = lambda: pd.DataFrame()
+    build_recent_large_trades = lambda: pd.DataFrame()
+
+try:
+    from src.execution import TradingConfig
+except ImportError as e:
+    st.error(f'Error importing TradingConfig: {e}')
+    class TradingConfig:
+        pass
+
+try:
+    from src.multi_asset import build_crypto_watchlist, build_market_regime_summary
+except ImportError as e:
+    st.error(f'Error importing multi_asset: {e}')
+    build_crypto_watchlist = lambda: pd.DataFrame()
+    build_market_regime_summary = lambda: pd.DataFrame()
+
+try:
+    from src.performance_journal import add_execution_status_to_candidates, build_open_trade_timeline, humanize_display_text
+except ImportError as e:
+    st.error(f'Error importing performance_journal: {e}')
+    add_execution_status_to_candidates = lambda df, pos, log: df
+    build_open_trade_timeline = lambda df, exits: pd.DataFrame()
+    humanize_display_text = lambda df: df
+
+try:
+    from src.risk_guardrails import build_exposure_summary, build_risk_overview, build_stress_test_table
+except ImportError as e:
+    st.error(f'Error importing risk_guardrails: {e}')
+    build_exposure_summary = lambda pos, account_size_usd: pd.DataFrame()
+    build_risk_overview = lambda pos, account_size_usd: pd.DataFrame()
+    build_stress_test_table = lambda pos: pd.DataFrame()
 
 
 st.set_page_config(page_title='Options Trading AI Dashboard', page_icon='📈', layout='wide')
@@ -48,6 +83,25 @@ CHART_LABELS = {
     'ticker': 'Ticker',
     'bias': 'Bias',
 }
+
+
+def check_startup_status() -> None:
+    """Display startup diagnostics if data files are missing."""
+    if not OUTPUT_DIR.exists():
+        st.warning('⚠️ Output directory does not exist yet. Waiting for first market cycle...')
+        return
+    
+    csv_files = list(OUTPUT_DIR.glob('*.csv'))
+    if not csv_files:
+        st.warning('📊 Dashboard initializing... Waiting for first market data from worker. Check back in 5 minutes.')
+        st.info('The market monitor worker is scanning positions and generating data. This page will auto-refresh.')
+        return
+    
+    latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
+    file_age_seconds = (datetime.now(timezone.utc) - pd.Timestamp(latest_file.stat().st_mtime, tz='UTC')).total_seconds()
+    
+    if file_age_seconds > 600:
+        st.info(f'📋 Last data refresh: {int(file_age_seconds / 60)} minutes ago. Worker may be sleeping during off-hours.')
 
 
 def inject_styles() -> None:
@@ -740,24 +794,100 @@ def build_ready_and_executed_tables(queue: pd.DataFrame, execution_log: pd.DataF
 
 
 inject_styles()
-signals = format_date_columns(ensure_signal_columns(load_latest_csv('latest_signals')))
-candidates = format_date_columns(ensure_candidate_columns(load_latest_csv('options_candidates')))
-backtest = format_date_columns(load_latest_csv('backtest_summary'))
-execution_preview = format_date_columns(load_latest_csv('execution_preview'))
-execution_log = format_date_columns(load_latest_csv('execution_log'))
-monitor_status = format_date_columns(load_latest_csv('monitor_status'))
-broker_account_status = format_date_columns(load_latest_csv('broker_account_status'))
-broker_positions = format_date_columns(ensure_positions_columns(load_latest_csv('broker_positions')))
-broker_orders = format_date_columns(load_latest_csv('broker_orders'))
-performance_journal = format_date_columns(load_latest_csv('performance_journal'))
-performance_summary = format_date_columns(load_latest_csv('performance_summary'))
-exposure_summary = format_date_columns(load_latest_csv('exposure_summary'))
-risk_overview = format_date_columns(load_latest_csv('risk_overview'))
-stress_scenarios = format_date_columns(load_latest_csv('stress_scenarios'))
-alerts_feed = format_date_columns(load_latest_csv('alerts_feed'))
-strategy_attribution = format_date_columns(load_latest_csv('strategy_attribution'))
-execution_quality = format_date_columns(load_latest_csv('execution_quality'))
-crypto_watchlist = format_date_columns(load_latest_csv('crypto_watchlist'))
+check_startup_status()
+
+try:
+    signals = format_date_columns(ensure_signal_columns(load_latest_csv('latest_signals')))
+except Exception as e:
+    st.error(f'Error loading signals: {e}')
+    signals = pd.DataFrame()
+
+try:
+    candidates = format_date_columns(ensure_candidate_columns(load_latest_csv('options_candidates')))
+except Exception as e:
+    st.error(f'Error loading candidates: {e}')
+    candidates = pd.DataFrame()
+
+try:
+    backtest = format_date_columns(load_latest_csv('backtest_summary'))
+except Exception:
+    backtest = pd.DataFrame()
+
+try:
+    execution_preview = format_date_columns(load_latest_csv('execution_preview'))
+except Exception:
+    execution_preview = pd.DataFrame()
+
+try:
+    execution_log = format_date_columns(load_latest_csv('execution_log'))
+except Exception:
+    execution_log = pd.DataFrame()
+
+try:
+    monitor_status = format_date_columns(load_latest_csv('monitor_status'))
+except Exception:
+    monitor_status = pd.DataFrame()
+
+try:
+    broker_account_status = format_date_columns(load_latest_csv('broker_account_status'))
+except Exception:
+    broker_account_status = pd.DataFrame()
+
+try:
+    broker_positions = format_date_columns(ensure_positions_columns(load_latest_csv('broker_positions')))
+except Exception as e:
+    st.warning(f'Error loading broker positions: {e}')
+    broker_positions = pd.DataFrame()
+
+try:
+    broker_orders = format_date_columns(load_latest_csv('broker_orders'))
+except Exception:
+    broker_orders = pd.DataFrame()
+
+try:
+    performance_journal = format_date_columns(load_latest_csv('performance_journal'))
+except Exception:
+    performance_journal = pd.DataFrame()
+
+try:
+    performance_summary = format_date_columns(load_latest_csv('performance_summary'))
+except Exception:
+    performance_summary = pd.DataFrame()
+
+try:
+    exposure_summary = format_date_columns(load_latest_csv('exposure_summary'))
+except Exception:
+    exposure_summary = pd.DataFrame()
+
+try:
+    risk_overview = format_date_columns(load_latest_csv('risk_overview'))
+except Exception:
+    risk_overview = pd.DataFrame()
+
+try:
+    stress_scenarios = format_date_columns(load_latest_csv('stress_scenarios'))
+except Exception:
+    stress_scenarios = pd.DataFrame()
+
+try:
+    alerts_feed = format_date_columns(load_latest_csv('alerts_feed'))
+except Exception:
+    alerts_feed = pd.DataFrame()
+
+try:
+    strategy_attribution = format_date_columns(load_latest_csv('strategy_attribution'))
+except Exception:
+    strategy_attribution = pd.DataFrame()
+
+try:
+    execution_quality = format_date_columns(load_latest_csv('execution_quality'))
+except Exception:
+    execution_quality = pd.DataFrame()
+
+try:
+    crypto_watchlist = format_date_columns(load_latest_csv('crypto_watchlist'))
+except Exception:
+    crypto_watchlist = pd.DataFrame()
 market_regime = format_date_columns(load_latest_csv('market_regime'))
 opportunity_discovery = format_date_columns(load_latest_csv('opportunity_discovery'))
 catalyst_news = format_date_columns(load_latest_csv('catalyst_news'))

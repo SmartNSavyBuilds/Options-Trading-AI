@@ -1,10 +1,14 @@
 services:
   options-gateway:
+    profiles:
+      - secure
     ports: []
 
   options-proxy:
     image: caddy:2
     container_name: options-proxy
+    profiles:
+      - secure
     depends_on:
       options-gateway:
         condition: service_healthy

@@ -1,0 +1,21 @@
+.git
+.pytest_cache
+__pycache__
+*.pyc
+.env
+outputs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.git/
+.venv/
+outputs/
+.env
+
+# Keep required runtime refresh executables in image for worker feed updates.
+!discover_opportunities.pyc
+!market_monitor.pyc
+!multi_asset_report.pyc
+!import_congressional_trades.pyc

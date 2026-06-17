@@ -20,16 +20,21 @@ Multi-user future path:
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import hmac
 import os
 import secrets
-from datetime import datetime, timezone, timedelta
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import Cookie, FastAPI, Form, HTTPException, Request, Response
+from fastapi import Cookie, FastAPI, Form, Request, Response, WebSocket
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from starlette.websockets import WebSocketDisconnect, WebSocketState
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import ConnectionClosed
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -67,6 +72,40 @@ def _new_session() -> str:
     token = secrets.token_urlsafe(48)
     _active_sessions[token] = datetime.now(timezone.utc) + timedelta(seconds=SESSION_MAX_AGE_SECONDS)
     return token
+
+
+HOP_BY_HOP_HEADERS = {
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailers',
+    'transfer-encoding',
+    'upgrade',
+}
+
+
+def _build_target_url(path: str, query_params, websocket: bool = False) -> str:
+    upstream_base = STREAMLIT_ORIGIN.rstrip('/')
+    if websocket:
+        if upstream_base.startswith('https://'):
+            upstream_base = 'wss://' + upstream_base[len('https://'):]
+        elif upstream_base.startswith('http://'):
+            upstream_base = 'ws://' + upstream_base[len('http://'):]
+
+    target = f'{upstream_base}/{path}'
+    if query_params:
+        target += f'?{urlencode(list(query_params.multi_items()), doseq=True)}'
+    return target
+
+
+def _filter_upstream_response_headers(headers: httpx.Headers) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS
+    }
 
 
 # ── Login page ──────────────────────────────────────────────────────────────
@@ -168,6 +207,77 @@ async def logout(response: Response, token: str | None = Cookie(default=None, al
 
 # ── Proxy all other traffic through to Streamlit ───────────────────────────
 
+@app.websocket('/{path:path}')
+async def websocket_proxy(websocket: WebSocket, path: str) -> None:
+    session_token = websocket.cookies.get(SESSION_COOKIE)
+    if not _session_valid(session_token):
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    target_url = _build_target_url(path, websocket.query_params, websocket=True)
+
+    request_headers = {
+        key: value
+        for key, value in websocket.headers.items()
+        if key.lower() not in {'host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-extensions'}
+    }
+
+    subprotocols_header = websocket.headers.get('sec-websocket-protocol', '')
+    subprotocols = [proto.strip() for proto in subprotocols_header.split(',') if proto.strip()]
+
+    try:
+        async with ws_connect(
+            target_url,
+            additional_headers=request_headers,
+            subprotocols=subprotocols,
+            max_size=None,
+        ) as upstream:
+
+            async def client_to_upstream() -> None:
+                while True:
+                    message = await websocket.receive()
+                    message_type = message.get('type')
+
+                    if message_type == 'websocket.disconnect':
+                        break
+                    if message.get('text') is not None:
+                        await upstream.send(message['text'])
+                    elif message.get('bytes') is not None:
+                        await upstream.send(message['bytes'])
+
+            async def upstream_to_client() -> None:
+                async for message in upstream:
+                    if isinstance(message, str):
+                        await websocket.send_text(message)
+                    else:
+                        await websocket.send_bytes(message)
+
+            tasks = {
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+            }
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            for task in done:
+                error = task.exception()
+                if error and not isinstance(error, (WebSocketDisconnect, ConnectionClosed)):
+                    raise error
+
+    except (WebSocketDisconnect, ConnectionClosed):
+        return
+    except Exception:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1011)
+        return
+    finally:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            with suppress(RuntimeError):
+                await websocket.close()
+
 @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
 async def proxy(
     request: Request,
@@ -177,12 +287,13 @@ async def proxy(
     if not _session_valid(session_token):
         return RedirectResponse(url='/login', status_code=303)
 
-    target_url = f'{STREAMLIT_ORIGIN.rstrip("/")}/{path}'
-    if request.query_params:
-        target_url += f'?{str(request.query_params)}'
+    target_url = _build_target_url(path, request.query_params)
 
-    headers = dict(request.headers)
-    headers.pop('host', None)
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != 'host'
+    }
     body = await request.body()
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -204,5 +315,5 @@ async def proxy(
     return StreamingResponse(
         content=iter([upstream.content]),
         status_code=upstream.status_code,
-        headers=dict(upstream.headers),
+        headers=_filter_upstream_response_headers(upstream.headers),
     )

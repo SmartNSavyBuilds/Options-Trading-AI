@@ -4,7 +4,7 @@ services:
     container_name: options-dashboard
     env_file:
       - .env
-    command: python -m streamlit run dashboard.py --server.port 8502 --server.headless true --server.address 0.0.0.0
+    command: python -m streamlit run dashboard.py --server.port 8502 --server.headless true --server.address 0.0.0.0 --server.enableCORS false --server.enableXsrfProtection false
     expose:
       - "8502"
     volumes:

@@ -178,8 +178,8 @@ async def proxy(
         return RedirectResponse(url='/login', status_code=303)
 
     target_url = f'{STREAMLIT_ORIGIN.rstrip("/")}/{path}'
-    if request.query_string:
-        target_url += f'?{request.query_string.decode()}'
+    if request.query_params:
+        target_url += f'?{str(request.query_params)}'
 
     headers = dict(request.headers)
     headers.pop('host', None)

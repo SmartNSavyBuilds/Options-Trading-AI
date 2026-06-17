@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import traceback
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 import time
@@ -22,10 +26,66 @@ PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_DIR / 'outputs'
 OUTPUT_DIR.mkdir(exist_ok=True)
 STATUS_FILE = OUTPUT_DIR / 'monitor_status.csv'
+FAILURE_LOG_FILE = OUTPUT_DIR / 'monitor_failures.jsonl'
 
 # US market hours in UTC: regular session 13:30–20:00, pre-market starts ~12:00
 _PREMARKET_OPEN_UTC = 12   # 8am ET
 _MARKET_CLOSE_UTC   = 21   # 5pm ET (includes after-hours buffer)
+
+# Autonomous safety thresholds (override via env)
+_MAX_CONSECUTIVE_FAILURES = int(os.getenv('WORKER_MAX_CONSECUTIVE_FAILURES', '5'))
+_STALE_HEARTBEAT_SECONDS  = int(os.getenv('WORKER_HEALTH_MAX_AGE_SECONDS', '1800'))  # 30 min
+_OPS_WEBHOOK_URL          = os.getenv('OPS_WEBHOOK_URL', '').strip()
+
+
+def _send_alert(event: str, detail: str) -> None:
+    """POST a compact JSON alert to OPS_WEBHOOK_URL (Discord/Slack/generic).
+    Silent no-op when the env var is not configured."""
+    if not _OPS_WEBHOOK_URL:
+        return
+    payload = json.dumps({
+        'username': 'Trade Desk Worker',
+        'content': f'**[{event}]** {detail}',
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            _OPS_WEBHOOK_URL,
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Never let alert failure break the worker loop
+
+
+def _log_failure(error: Exception, cycle_num: int) -> None:
+    """Append structured failure entry to FAILURE_LOG_FILE for dashboard visibility."""
+    entry = {
+        'ts': datetime.now(timezone.utc).isoformat(),
+        'cycle': cycle_num,
+        'error': type(error).__name__,
+        'detail': str(error)[:400],
+    }
+    try:
+        with FAILURE_LOG_FILE.open('a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        pass
+
+
+def _check_stale_heartbeat() -> bool:
+    """Returns True (and fires an alert) if the last heartbeat is older than threshold."""
+    if not STATUS_FILE.exists():
+        return False  # first-run — no heartbeat yet
+    age = time.time() - STATUS_FILE.stat().st_mtime
+    if age > _STALE_HEARTBEAT_SECONDS:
+        _send_alert(
+            'STALE HEARTBEAT',
+            f'monitor_status.csv is {int(age / 60)}m old — worker may be stuck or crashed.',
+        )
+        return True
+    return False
 
 
 def _sleep_seconds(normal_interval: int, market_status: str) -> int:
@@ -112,8 +172,45 @@ def main() -> None:
         run_cycle()
         return
 
+    consecutive_failures = 0
+    cycle_num = 0
+
     while True:
-        market_status = run_cycle()
+        cycle_num += 1
+        try:
+            market_status = run_cycle()
+            consecutive_failures = 0  # reset on success
+        except Exception as exc:
+            consecutive_failures += 1
+            _log_failure(exc, cycle_num)
+            print(f'[ERROR] Cycle {cycle_num} failed ({consecutive_failures} consecutive): {exc}')
+            traceback.print_exc()
+
+            _send_alert(
+                'WORKER FAILURE',
+                f'Cycle {cycle_num} failed ({consecutive_failures}/{_MAX_CONSECUTIVE_FAILURES}): {type(exc).__name__}: {str(exc)[:300]}',
+            )
+
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                _send_alert(
+                    'WORKER HALTED',
+                    f'Halting loop after {consecutive_failures} consecutive failures. Manual restart required.',
+                )
+                print(f'[HALT] Too many consecutive failures ({consecutive_failures}). Exiting loop.')
+                break
+
+            # Write a degraded status so dashboard shows the problem
+            pd.DataFrame([{
+                'last_run_utc': datetime.now(timezone.utc).isoformat(),
+                'monitor_status': 'error',
+                'connection_status': 'unknown',
+                'market_status': 'unknown',
+                'open_positions': 0,
+                'note': f'Cycle {cycle_num} failed: {type(exc).__name__}: {str(exc)[:200]}',
+            }]).to_csv(STATUS_FILE, index=False)
+
+            market_status = 'unknown'
+
         sleep_secs = _sleep_seconds(args.interval_seconds, market_status)
         print(f'Sleeping {sleep_secs}s until next cycle (market: {market_status}).')
         time.sleep(sleep_secs)

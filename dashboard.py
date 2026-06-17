@@ -1,6 +1,8 @@
 import os
 import re
+import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -910,7 +912,93 @@ if crypto_watchlist.empty:
 if market_regime.empty:
     market_regime = build_market_regime_summary(signals)
 
+
+# ── Build and version metadata ────────────────────────────────────────────
+def _get_build_info() -> dict:
+    """Return deployed git commit, branch, and build timestamp."""
+    info = {'commit': 'unknown', 'branch': 'unknown', 'built_at': 'unknown'}
+    try:
+        info['commit'] = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=str(PROJECT_DIR), stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        info['branch'] = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=str(PROJECT_DIR), stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        info['built_at'] = subprocess.check_output(
+            ['git', 'log', '-1', '--format=%ci'],
+            cwd=str(PROJECT_DIR), stderr=subprocess.DEVNULL, text=True
+        ).strip()[:16]
+    except Exception:
+        pass
+    return info
+
+
+def _get_worker_health() -> tuple[str, str, str]:
+    """Returns (status_label, status_color, staleness_note) from monitor_status.csv."""
+    status_file = OUTPUT_DIR / 'monitor_status.csv'
+    failure_file = OUTPUT_DIR / 'monitor_failures.jsonl'
+
+    if not status_file.exists():
+        return 'No heartbeat', '#f87171', 'Worker has not run yet.'
+
+    age_seconds = time.time() - status_file.stat().st_mtime
+    age_min = int(age_seconds / 60)
+
+    try:
+        status_df = pd.read_csv(status_file)
+        worker_status = str(status_df.iloc[0].get('monitor_status', 'unknown')).lower() if not status_df.empty else 'unknown'
+        note = str(status_df.iloc[0].get('note', '')) if not status_df.empty else ''
+    except Exception:
+        worker_status, note = 'unknown', ''
+
+    recent_failures = 0
+    if failure_file.exists():
+        try:
+            lines = failure_file.read_text().strip().splitlines()
+            recent_failures = len(lines)
+        except Exception:
+            pass
+
+    if worker_status == 'error':
+        return 'Worker Error', '#f87171', note[:120]
+    if age_seconds > 1800:
+        return f'Stale ({age_min}m ago)', '#fb923c', f'Heartbeat overdue. Last seen {age_min}m ago.'
+    if recent_failures > 0:
+        return f'Running ({recent_failures} past failures)', '#fbbf24', f'{recent_failures} logged failures.'
+    if age_min < 1:
+        return 'Running (just updated)', '#4ade80', ''
+    return f'Running ({age_min}m ago)', '#4ade80', ''
+
+
+build_info = _get_build_info()
+worker_health_label, worker_health_color, worker_health_note = _get_worker_health()
+
 st.title('Options Trading AI | Multi Asset Command Center')
+
+# Live build and operational health banner
+_trading_mode = os.getenv('TRADING_MODE', 'paper').upper()
+_mode_color = '#4ade80' if _trading_mode == 'PAPER' else '#f87171'
+st.markdown(
+    f"""
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+                background:rgba(15,35,64,0.8);border:1px solid rgba(100,116,139,0.4);
+                border-radius:10px;padding:10px 16px;margin-bottom:10px;font-size:0.82rem;">
+        <span style="color:#94a3b8;">Build:</span>
+        <code style="color:#60a5fa;">{build_info['commit']}</code>
+        <span style="color:#475569;">@{build_info['branch']}</span>
+        <span style="color:#475569;margin-left:4px;">{build_info['built_at']}</span>
+        <span style="margin-left:12px;color:#94a3b8;">Mode:</span>
+        <span style="color:{_mode_color};font-weight:600;">{_trading_mode}</span>
+        <span style="margin-left:12px;color:#94a3b8;">Worker:</span>
+        <span style="color:{worker_health_color};font-weight:600;">{worker_health_label}</span>
+        {'<span style="color:#fb923c;margin-left:6px;font-size:0.78rem;">' + worker_health_note + '</span>' if worker_health_note else ''}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.markdown(
     """
     <div class="dashboard-banner">

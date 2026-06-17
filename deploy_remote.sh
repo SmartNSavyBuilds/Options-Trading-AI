@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy_remote.sh — bring up the secure, mobile-accessible trading stack.
+# deploy_remote.sh â€” bring up the secure, mobile-accessible trading stack.
 #
 # Run from the project directory on the VM (as the deploy user):
 #   bash deploy_remote.sh
@@ -12,6 +12,16 @@
 set -euo pipefail
 
 log() { printf '\n[deploy] %s\n' "$1"; }
+
+upsert_env() {
+    local key="$1"
+    local value="$2"
+    if grep -q -E "^${key}=" .env; then
+        sed -i "s|^${key}=.*|${key}=${value}|" .env
+    else
+        printf '%s=%s\n' "${key}" "${value}" >> .env
+    fi
+}
 
 if [[ ! -f .env ]]; then
     echo "Missing .env. Copy .env.example to .env and fill required values first." >&2
@@ -31,6 +41,16 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     echo "The following required .env values are empty: ${MISSING[*]}" >&2
     exit 1
 fi
+
+DEPLOY_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+DEPLOY_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+upsert_env "DEPLOY_COMMIT" "${DEPLOY_COMMIT}"
+upsert_env "DEPLOY_BRANCH" "${DEPLOY_BRANCH}"
+upsert_env "DEPLOYED_AT" "${DEPLOYED_AT}"
+
+log "Stamped deploy metadata: ${DEPLOY_COMMIT} @ ${DEPLOY_BRANCH} (${DEPLOYED_AT})"
 
 log "Building and starting the secure remote stack"
 docker compose \

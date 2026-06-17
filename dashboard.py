@@ -916,7 +916,16 @@ if market_regime.empty:
 # ── Build and version metadata ────────────────────────────────────────────
 def _get_build_info() -> dict:
     """Return deployed git commit, branch, and build timestamp."""
-    info = {'commit': 'unknown', 'branch': 'unknown', 'built_at': 'unknown'}
+    info = {
+        'commit': os.getenv('DEPLOY_COMMIT', 'unknown').strip() or 'unknown',
+        'branch': os.getenv('DEPLOY_BRANCH', 'unknown').strip() or 'unknown',
+        'built_at': os.getenv('DEPLOYED_AT', 'unknown').strip() or 'unknown',
+    }
+
+    # If deploy metadata is not provided, fall back to local git metadata.
+    if info['commit'] != 'unknown' and info['branch'] != 'unknown' and info['built_at'] != 'unknown':
+        return info
+
     try:
         info['commit'] = subprocess.check_output(
             ['git', 'rev-parse', '--short', 'HEAD'],

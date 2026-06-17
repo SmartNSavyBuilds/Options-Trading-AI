@@ -214,7 +214,6 @@ async def websocket_proxy(websocket: WebSocket, path: str) -> None:
         await websocket.close(code=4401)
         return
 
-    await websocket.accept()
     target_url = _build_target_url(path, websocket.query_params, websocket=True)
 
     request_headers = {
@@ -233,6 +232,7 @@ async def websocket_proxy(websocket: WebSocket, path: str) -> None:
             subprotocols=subprotocols,
             max_size=None,
         ) as upstream:
+            await websocket.accept(subprotocol=upstream.subprotocol)
 
             async def client_to_upstream() -> None:
                 while True:
@@ -271,6 +271,8 @@ async def websocket_proxy(websocket: WebSocket, path: str) -> None:
         return
     except Exception:
         if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1011)
+        elif websocket.client_state == WebSocketState.CONNECTING:
             await websocket.close(code=1011)
         return
     finally:

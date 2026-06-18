@@ -42,6 +42,11 @@ class TradingConfig:
     account_size_usd: float = 100_000.0
     max_positions: int = 5
     max_position_pct: float = 2.0
+    discord_webhook_url: str = ''  # Add this line
+    min_option_dte: int = 14
+    max_option_dte: int = 45
+    target_option_dte_min: int = 21
+    target_option_dte_max: int = 45
     api_key: str = ''
     secret_key: str = ''
     base_url: str = PAPER_BASE_URL
@@ -59,10 +64,22 @@ class TradingConfig:
         account_size_usd = float(os.getenv('PAPER_ACCOUNT_SIZE', '100000'))
         max_positions = int(os.getenv('MAX_OPEN_POSITIONS', '5'))
         max_position_pct = float(os.getenv('MAX_POSITION_PCT', '2.0'))
+        min_option_dte = int(os.getenv('MIN_OPTION_DTE', '14'))
+        max_option_dte = int(os.getenv('MAX_OPTION_DAYS', '45'))
+        target_option_dte_min = int(os.getenv('TARGET_OPTION_DTE_MIN', '21'))
+        target_option_dte_max = int(os.getenv('TARGET_OPTION_DTE_MAX', '45'))
+
+        # Keep DTE bounds consistent even if env values are misconfigured.
+        min_option_dte = max(1, min_option_dte)
+        max_option_dte = max(min_option_dte, max_option_dte)
+        target_option_dte_min = max(min_option_dte, target_option_dte_min)
+        target_option_dte_max = max(target_option_dte_min, min(max_option_dte, target_option_dte_max))
+
         api_key = os.getenv('ALPACA_API_KEY', '').strip()
         secret_key = os.getenv('ALPACA_SECRET_KEY', '').strip()
         default_base_url = PAPER_BASE_URL if trading_mode == 'paper' else LIVE_BASE_URL
         base_url = os.getenv('ALPACA_BASE_URL', default_base_url).strip() or default_base_url
+        discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL', '').strip()
 
         return cls(
             broker=broker,
@@ -73,6 +90,11 @@ class TradingConfig:
             account_size_usd=account_size_usd,
             max_positions=max_positions,
             max_position_pct=max_position_pct,
+            discord_webhook_url=discord_webhook_url,
+            min_option_dte=min_option_dte,
+            max_option_dte=max_option_dte,
+            target_option_dte_min=target_option_dte_min,
+            target_option_dte_max=target_option_dte_max,
             api_key=api_key,
             secret_key=secret_key,
             base_url=base_url,
@@ -128,12 +150,23 @@ def _infer_option_type_and_strike(options_setup: str, bias: str) -> tuple[str, f
     return option_type, strike
 
 
-def fetch_option_contracts(config: TradingConfig, underlying_symbol: str, max_days: int = 10, limit: int = 200) -> pd.DataFrame:
+def fetch_option_contracts(
+    config: TradingConfig,
+    underlying_symbol: str,
+    min_days: int | None = None,
+    max_days: int | None = None,
+    limit: int = 200,
+) -> pd.DataFrame:
     if config.broker != 'alpaca' or not config.api_key or not config.secret_key:
         return pd.DataFrame()
 
+    min_days = int(min_days if min_days is not None else config.min_option_dte)
+    max_days = int(max_days if max_days is not None else config.max_option_dte)
+    min_days = max(1, min_days)
+    max_days = max(min_days, max_days)
+
     today = pd.Timestamp.now().normalize()
-    expiry_gte = (today + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    expiry_gte = (today + pd.Timedelta(days=min_days)).strftime('%Y-%m-%d')
     expiry_lte = (today + pd.Timedelta(days=max_days)).strftime('%Y-%m-%d')
 
     response = requests.get(
@@ -157,7 +190,7 @@ def fetch_option_contracts(config: TradingConfig, underlying_symbol: str, max_da
     contracts['expiration_date'] = pd.to_datetime(contracts['expiration_date'], errors='coerce')
     today = pd.Timestamp.now().normalize()
     contracts['days_to_expiration'] = (contracts['expiration_date'] - today).dt.days
-    contracts = contracts[(contracts['days_to_expiration'] >= 1) & (contracts['days_to_expiration'] <= max_days)].copy()
+    contracts = contracts[(contracts['days_to_expiration'] >= min_days) & (contracts['days_to_expiration'] <= max_days)].copy()
     return contracts
 
 
@@ -166,7 +199,11 @@ def choose_best_option_contract(
     underlying_symbol: str,
     option_type: str,
     target_strike: float,
-    max_days: int = 10,
+    min_days: int = 14,
+    max_days: int = 45,
+    target_min_days: int = 21,
+    target_max_days: int = 45,
+    target_days: int | None = None,
 ) -> dict[str, Any] | None:
     if contracts.empty:
         return None
@@ -184,7 +221,14 @@ def choose_best_option_contract(
     elif 'days_to_expiration' not in working.columns:
         working['days_to_expiration'] = max_days + 1
 
-    working = working[(working['days_to_expiration'] >= 1) & (working['days_to_expiration'] <= max_days)]
+    min_days = max(1, int(min_days))
+    max_days = max(min_days, int(max_days))
+    target_min_days = max(min_days, int(target_min_days))
+    target_max_days = max(target_min_days, min(max_days, int(target_max_days)))
+    target_days = int(target_days) if target_days is not None else (target_min_days + target_max_days) // 2
+    target_days = max(min_days, min(max_days, target_days))
+
+    working = working[(working['days_to_expiration'] >= min_days) & (working['days_to_expiration'] <= max_days)]
     if working.empty:
         return None
 
@@ -193,15 +237,48 @@ def choose_best_option_contract(
         working['open_interest'] = 0
     working['open_interest'] = pd.to_numeric(working['open_interest'], errors='coerce').fillna(0)
     working['strike_distance'] = (working['strike_price'] - float(target_strike or 0.0)).abs()
-    working = working.sort_values(['days_to_expiration', 'strike_distance', 'open_interest'], ascending=[True, True, False])
+
+    dte = pd.to_numeric(working['days_to_expiration'], errors='coerce').fillna(max_days).astype(int)
+    in_window = (dte >= target_min_days) & (dte <= target_max_days)
+    dte_distance = dte.apply(
+        lambda v: 0 if target_min_days <= v <= target_max_days else min(abs(v - target_min_days), abs(v - target_max_days))
+    )
+    target_center_distance = (dte - target_days).abs()
+    working['in_target_window'] = in_window.astype(int)
+    working['target_window_distance'] = dte_distance
+    working['target_center_distance'] = target_center_distance
+
+    working = working.sort_values(
+        ['in_target_window', 'target_window_distance', 'target_center_distance', 'strike_distance', 'open_interest', 'days_to_expiration'],
+        ascending=[False, True, True, True, False, True],
+    )
     return working.iloc[0].to_dict()
+
+
+def _resolve_target_days_from_row(row: pd.Series, default_days: int) -> int:
+    expiration_target = str(row.get('expiration_target', '') or '').strip()
+    if expiration_target and expiration_target.lower() != 'unavailable':
+        target_dt = pd.to_datetime(expiration_target, errors='coerce')
+        if pd.notna(target_dt):
+            target_days = int((target_dt.normalize() - pd.Timestamp.now().normalize()).days)
+            if target_days > 0:
+                return target_days
+
+    numeric_dte = pd.to_numeric(row.get('days_to_expiration', None), errors='coerce')
+    if pd.notna(numeric_dte):
+        parsed = int(numeric_dte)
+        if parsed > 0:
+            return parsed
+
+    return max(1, int(default_days))
 
 
 def prepare_option_execution_preview(
     queue: pd.DataFrame,
     config: TradingConfig,
     contracts_map: dict[str, pd.DataFrame] | None = None,
-    max_days: int = 10,
+    min_days: int | None = None,
+    max_days: int | None = None,
     top_n: int = 2,
 ) -> pd.DataFrame:
     if queue.empty:
@@ -219,6 +296,11 @@ def prepare_option_execution_preview(
         if col not in working.columns:
             working[col] = default
 
+    min_days = int(min_days if min_days is not None else config.min_option_dte)
+    max_days = int(max_days if max_days is not None else config.max_option_dte)
+    min_days = max(1, min_days)
+    max_days = max(min_days, max_days)
+
     preview_rows: list[dict[str, Any]] = []
     for _, row in working.iterrows():
         if len(preview_rows) >= top_n:
@@ -228,9 +310,25 @@ def prepare_option_execution_preview(
         already_submitted = existing_status in {'new', 'accepted', 'filled', 'partially_filled', 'submitted', 'pending_new'}
         underlying = str(row.get('ticker', '')).upper()
         option_type, target_strike = _infer_option_type_and_strike(str(row.get('options_setup', '')), str(row.get('bias', 'neutral')))
+        target_days = _resolve_target_days_from_row(row, default_days=(config.target_option_dte_min + config.target_option_dte_max) // 2)
 
-        contracts = contracts_map.get(underlying, pd.DataFrame()) if contracts_map else fetch_option_contracts(config, underlying, max_days=max_days)
-        chosen = choose_best_option_contract(contracts, underlying_symbol=underlying, option_type=option_type, target_strike=target_strike, max_days=max_days)
+        contracts = contracts_map.get(underlying, pd.DataFrame()) if contracts_map else fetch_option_contracts(
+            config,
+            underlying,
+            min_days=min_days,
+            max_days=max_days,
+        )
+        chosen = choose_best_option_contract(
+            contracts,
+            underlying_symbol=underlying,
+            option_type=option_type,
+            target_strike=target_strike,
+            min_days=min_days,
+            max_days=max_days,
+            target_min_days=config.target_option_dte_min,
+            target_max_days=config.target_option_dte_max,
+            target_days=target_days,
+        )
         if not chosen:
             continue
 
@@ -253,6 +351,7 @@ def prepare_option_execution_preview(
             'options_setup': row.get('options_setup', 'No trade'),
             'contract_name': chosen.get('name', ''),
             'expiration_date': str(chosen.get('expiration_date', ''))[:10],
+            'days_to_expiration': int(chosen.get('days_to_expiration', 0) or 0),
             'strike_price': float(chosen.get('strike_price', 0.0) or 0.0),
             'option_type': option_type,
             'estimated_contract_cost_usd': round(estimated_contract_cost, 2),
@@ -362,9 +461,14 @@ def run_execution_cycle(config: TradingConfig) -> tuple[pd.DataFrame, pd.DataFra
     return preview, results
 
 
-def run_option_execution_cycle(config: TradingConfig, max_days: int = 10, top_n: int = 2) -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_option_execution_cycle(
+    config: TradingConfig,
+    min_days: int | None = None,
+    max_days: int | None = None,
+    top_n: int = 2,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     queue = load_latest_csv('paper_trade_queue')
-    preview = prepare_option_execution_preview(queue, config, max_days=max_days, top_n=top_n)
+    preview = prepare_option_execution_preview(queue, config, min_days=min_days, max_days=max_days, top_n=top_n)
     results = submit_orders(preview, config)
     update_queue_after_execution(results)
     return preview, results
@@ -780,54 +884,61 @@ def submit_single_order(order: pd.Series, config: TradingConfig) -> dict[str, An
         'client_order_id': order['client_order_id'],
     }
 
+    def _notify_and_return(result: dict[str, Any]) -> dict[str, Any]:
+        if config.discord_webhook_url:
+            title, fields, color, status = _build_order_notification(order, result)
+            if fields:
+                notify_discord(config.discord_webhook_url, title, fields, color, status)
+        return result
+
     if _as_bool(order.get('already_submitted', False)):
-        return {
+        return _notify_and_return({
             **base_result,
             'status': 'skipped_existing',
             'detail': 'Order for this ticker was already submitted previously and was skipped.',
-        }
+        })
 
     if not _as_bool(order.get('approved_for_submit', False)):
-        return {
+        return _notify_and_return({
             **base_result,
             'status': 'blocked',
             'detail': 'Order is still waiting for approval. Mark it approved or switch the approval workflow to automatic.',
-        }
+        })
 
     if not bool(order.get('ready_for_broker_submit', False)):
-        return {
+        return _notify_and_return({
             **base_result,
             'status': 'blocked',
             'detail': 'Order preview is not ready for broker submit.',
-        }
+        })
 
     if config.trading_mode == 'live' and not _bool_env('CONFIRM_LIVE_TRADING', False):
-        return {
+        return _notify_and_return({
             **base_result,
             'status': 'blocked',
             'detail': 'Live trading confirmation flag is not enabled.',
-        }
+        })
 
     if not config.auto_submit:
-        return {
+        return _notify_and_return({
             **base_result,
             'status': 'preview_only',
             'detail': 'AUTO_SUBMIT is disabled. No broker order was sent.',
-        }
+        })
 
     if config.broker != 'alpaca':
-        return {
+        return _notify_and_return({
             **base_result,
             'status': 'blocked',
             'detail': f"Unsupported broker: {config.broker}",
-        }
+        })
 
     if not config.api_key or not config.secret_key:
-        return {
+        return _notify_and_return({
             **base_result,
             'status': 'missing_credentials',
             'detail': 'Alpaca credentials are not configured.',
-        }
+        })
 
     try:
         payload = {
@@ -846,14 +957,170 @@ def submit_single_order(order: pd.Series, config: TradingConfig) -> dict[str, An
         )
         response.raise_for_status()
         body = response.json()
-        return {
+        result = {
             **base_result,
             'status': body.get('status', 'accepted'),
             'detail': body.get('id', 'order_submitted'),
         }
+        if config.discord_webhook_url:
+            title, fields, color, status = _build_order_notification(order, result)
+            notify_discord(config.discord_webhook_url, title, fields, color, status)
+        return result
     except Exception as exc:
-        return {
+        result = {
             **base_result,
             'status': 'error',
             'detail': str(exc),
         }
+        if config.discord_webhook_url:
+            title, fields, color, status = _build_order_notification(order, result)
+            notify_discord(config.discord_webhook_url, title, fields, color, status)
+        return result
+
+
+def notify_discord(
+    webhook_url: str,
+    title: str,
+    fields: dict[str, str],
+    color: int = 3447003,
+    status: str = 'submitted',
+) -> bool:
+    """
+    Send a trade notification to Discord via webhook.
+
+    Args:
+        webhook_url: Discord webhook URL from .env
+        title: Main notification title (e.g., "Order Submitted", "Position Closed")
+        fields: Dict of field_name -> field_value for the embed
+        color: Decimal color code (default blue). Use 15158332 for green (wins), 15548997 for red (losses)
+        status: "submitted" | "filled" | "rejected" | "closed_profit" | "closed_loss"
+
+    Returns:
+        True if sent successfully, False if webhook URL missing or request failed
+    """
+    if not webhook_url or not webhook_url.startswith('http'):
+        return False
+
+    embed = {
+        'title': title,
+        'color': color,
+        'fields': [{'name': k, 'value': str(v), 'inline': True} for k, v in fields.items()],
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+
+    payload = {'embeds': [embed]}
+
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=5)
+        return response.status_code in {200, 204}
+    except Exception as exc:
+        print(f'Discord notification failed: {exc}')
+        return False
+
+
+def _build_order_notification(order: pd.Series, result: dict[str, Any]) -> tuple[str, dict[str, str], int, str]:
+    """Build Discord notification payload for a submitted/rejected order."""
+    ticker = str(order.get('underlying_ticker', order.get('ticker', '')))
+    proxy_side = str(order.get('proxy_side', '')).upper()
+    proxy_qty = int(order.get('proxy_qty', 0))
+
+    execution_style = str(order.get('execution_style', ''))
+    is_option = 'option' in execution_style
+
+    if is_option:
+        dte = int(order.get('days_to_expiration', 0) or 0)
+        strike = float(order.get('strike_price', 0.0) or 0.0)
+        cost = float(order.get('estimated_contract_cost_usd', 0.0) or 0.0)
+        option_type = str(order.get('option_type', '?')).upper()
+        ticker_display = f'{ticker} {dte} DTE ${strike} {option_type}'
+        notional = cost * proxy_qty
+    else:
+        price = float(order.get('last_close', 0.0) or 0.0)
+        ticker_display = ticker
+        notional = price * proxy_qty
+
+    status = str(result.get('status', 'unknown')).strip().lower()
+
+    if status in {'rejected', 'error', 'missing_credentials'}:
+        color = 15548997  # Red
+        title = f'⛔ Trade Rejected: {ticker_display}'
+        reason = result.get('detail', 'No reason provided')
+        fields = {
+            'Ticker': ticker,
+            'Side': proxy_side,
+            'Qty': str(proxy_qty),
+            'Reason': reason,
+            'Time': datetime.now().strftime('%H:%M:%S'),
+        }
+        status_label = 'rejected'
+    elif status in {'new', 'accepted', 'filled', 'partially_filled', 'pending_new', 'submitted'}:
+        color = 3447003  # Blue (pending)
+        title = f'✅ Trade Submitted: {ticker_display}'
+        fields = {
+            'Ticker': ticker,
+            'Side': proxy_side,
+            'Qty': str(proxy_qty),
+            'Estimated Notional': f'${notional:,.2f}',
+            'Status': status.title(),
+            'Time': datetime.now().strftime('%H:%M:%S'),
+        }
+        status_label = 'submitted'
+    elif status == 'skipped_existing':
+        color = 6710886  # Grey
+        title = f'⏭ Trade Skipped (Already Open): {ticker_display}'
+        fields = {
+            'Ticker': ticker,
+            'Reason': 'Position already submitted or filled',
+            'Time': datetime.now().strftime('%H:%M:%S'),
+        }
+        status_label = 'submitted'
+    elif status == 'blocked':
+        color = 15105570  # Orange
+        title = f'🚫 Trade Blocked: {ticker_display}'
+        fields = {
+            'Ticker': ticker,
+            'Reason': str(result.get('detail', 'Unknown block reason')),
+            'Time': datetime.now().strftime('%H:%M:%S'),
+        }
+        status_label = 'rejected'
+    elif status == 'preview_only':
+        color = 8421504  # Light grey
+        title = f'👁 Preview Only: {ticker_display}'
+        fields = {
+            'Ticker': ticker,
+            'Reason': 'AUTO SUBMIT is disabled',
+            'Time': datetime.now().strftime('%H:%M:%S'),
+        }
+        status_label = 'submitted'
+    else:
+        return 'Trade Preview', {}, 3447003, 'submitted'
+
+    return title, fields, color, status_label
+
+
+def _build_exit_notification(
+    symbol: str,
+    entry_price: float,
+    exit_price: float,
+    qty: int,
+    side: str,
+) -> tuple[str, dict[str, str], int, str]:
+    """Build Discord notification payload for a closed position with P&L."""
+    gross_pl = (exit_price - entry_price) * qty
+    pct_pl = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+
+    color = 15158332 if gross_pl >= 0 else 15548997  # Green if profit, red if loss
+    emoji = '🟢' if gross_pl >= 0 else '🔴'
+
+    title = f'{emoji} Position Closed: {symbol}'
+    fields = {
+        'Ticker': symbol,
+        'Entry Price': f'${entry_price:.2f}',
+        'Exit Price': f'${exit_price:.2f}',
+        'Qty': str(qty),
+        'P&L': f'${gross_pl:+,.2f} ({pct_pl:+.2f}%)',
+        'Time': datetime.now().strftime('%H:%M:%S'),
+    }
+    status_label = 'closed_profit' if gross_pl >= 0 else 'closed_loss'
+
+    return title, fields, color, status_label

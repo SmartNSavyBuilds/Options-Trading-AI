@@ -279,11 +279,17 @@ links: []
 - `rationale`: Why this decision? Reference to regime_note, incident, or thesis if applicable.
 - `owner`: Who made this decision?
 - `expected_outcome`: What do we expect to happen if this decision plays out as planned?
-- `decision_id`: Unique identifier for this decision (e.g., `dec_2026-07-10_001`)
+- `decision_id`: Human-friendly decision reference (e.g., `dec_2026-07-10_001`). Distinct from `id`, which equals the filename stem (`decision_log_2026-07-10_001`).
+
+**Optional Fields**:
+- `clears`: List of lint flag ids this decision resolves (e.g., `review:strategy_thesis_crypto_mixed`, `contradiction:crypto:mixed`). A cleared flag is downgraded from a warning to an acknowledged note that records this decision, so operator judgement stops the nag while staying auditable.
+- `outcome`: What actually happened. Absence past 7 days triggers the outcome follow-up warning.
 
 **Lint Rules**:
-- Rationale linkage: If rationale references a regime_note or incident, verify that page exists
-- Outcome tracking: Flag decisions older than 7 days without an outcome update (needs follow-up)
+- `decision_type`: Must be one of the four allowed values.
+- Rationale linkage: Every id in `links` must resolve to an existing page.
+- Outcome tracking: Flag decisions older than 7 days with no `outcome` (needs follow-up).
+- Flag clearing: Any `flag_id` listed in `clears` suppresses the matching warning (contradiction, unreviewed thesis) and marks it acknowledged.
 
 **Mutable Fields**: `links` only. Decisions are a permanent audit record; add a follow-up decision_log rather than editing.
 
@@ -291,7 +297,8 @@ links: []
 ```yaml
 # file: decision_log_2026-07-10_001.md
 schema_version: 1
-id: dec_2026-07-10_001
+id: decision_log_2026-07-10_001
+decision_id: dec_2026-07-10_001
 timestamp: 2026-07-10T11:30:00Z
 decision_type: override_control
 description: |
@@ -306,7 +313,9 @@ expected_outcome: |
   Protective orders should fill within 4 minutes. Position will scale to target
   70 delta SPY short strangles. P&L expected to be +0.3% to +0.8% by market close
   if SPY stays within 490-495 range.
-decision_id: dec_2026-07-10_001
+clears:
+  - review:strategy_thesis_options_mixed
+outcome: ''
 links:
   - incident_2026-07-10_001
 ```

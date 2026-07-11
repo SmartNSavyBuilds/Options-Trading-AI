@@ -1288,6 +1288,22 @@ def build_wiki_summary() -> dict:
             summary['lint'] = json.loads(lint_path.read_text(encoding='utf-8'))
         except (json.JSONDecodeError, OSError):
             summary['lint'] = None
+
+    findings = (summary.get('lint') or {}).get('findings', []) or []
+    summary['flags_open'] = sum(1 for f in findings if f.get('level') == 'warn' and f.get('flag_id'))
+    summary['flags_acknowledged'] = sum(1 for f in findings if f.get('level') == 'info')
+
+    decisions = [p for p in pages if p.get('type') == 'decision_log']
+    decisions.sort(key=lambda p: str(p.get('timestamp', '')), reverse=True)
+    summary['recent_decisions'] = [
+        {
+            'id': p.get('id', ''),
+            'decision_type': p.get('decision_type', ''),
+            'summary': p.get('summary', ''),
+            'timestamp': p.get('timestamp', ''),
+        }
+        for p in decisions[:3]
+    ]
     return summary
 
 
@@ -1351,6 +1367,45 @@ def render_wiki_summary(summary: dict) -> None:
     lint_color = '#f87171' if lint_errors else ('#fb923c' if lint_warnings else '#4ade80')
     lint_text = f'{lint_errors} error(s), {lint_warnings} warning(s)'
 
+    # Open vs acknowledged review/contradiction flags.
+    flags_open = int(summary.get('flags_open', 0))
+    flags_ack = int(summary.get('flags_acknowledged', 0))
+    flag_color = '#fb923c' if flags_open else '#4ade80'
+    flag_label = 'Flags: all clear' if not flags_open else f'Flags: {flags_open} open'
+    if flags_ack:
+        flag_label += f', {flags_ack} acknowledged'
+    flags_note = f'<span style="color:{flag_color};font-size:0.78rem;">{flag_label}</span>'
+
+    # Recent decision log entries.
+    decision_labels = {
+        'trade': 'Trade',
+        'override_control': 'Override control',
+        'strategy_shift': 'Strategy shift',
+        'investigation_result': 'Investigation result',
+    }
+    decisions = summary.get('recent_decisions') or []
+    decisions_html = ''
+    if decisions:
+        rows = ''
+        for decision in decisions:
+            label = decision_labels.get(
+                decision.get('decision_type', ''),
+                str(decision.get('decision_type', '')).replace('_', ' ').title(),
+            )
+            rows += (
+                '<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(100,116,139,0.35);'
+                'border-radius:10px;padding:6px 12px;margin-top:6px;">'
+                f'<div style="color:#93c5fd;font-weight:700;font-size:0.8rem;">{label}'
+                f'<span style="color:#64748b;font-weight:400;"> &middot; {decision.get("timestamp", "")}</span></div>'
+                f'<div style="color:#cbd5e1;font-size:0.8rem;margin-top:2px;">{decision.get("summary", "")}</div>'
+                '</div>'
+            )
+        decisions_html = (
+            '<div style="margin-top:8px;">'
+            '<div style="color:#94a3b8;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;">Recent decisions</div>'
+            f'{rows}</div>'
+        )
+
     # Per-asset market regime and thesis conviction cells.
     asset_regimes = summary.get('asset_regimes') or []
     context_html = ''
@@ -1395,9 +1450,11 @@ def render_wiki_summary(summary: dict) -> None:
                 <span style="color:#94a3b8;font-size:0.78rem;">{summary.get('page_count', 0)} pages</span>
                 {freshness_note}
                 <span style="color:{lint_color};font-size:0.78rem;">Lint: {lint_text}</span>
+                {flags_note}
             </div>
             {context_html}
             {incidents_html}
+            {decisions_html}
         </div>
         """,
         unsafe_allow_html=True,

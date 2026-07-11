@@ -94,6 +94,14 @@ def page_path(page_type: str, page_id: str) -> Path:
     return WIKI_DIR / SUBDIRS[page_type] / f"{page_id}.md"
 
 
+def next_sequence(page_type: str, date: str) -> int:
+    """Next 1-based sequence number for a time-series page on a given date."""
+    prefix = f"{page_type}_{date}_"
+    directory = WIKI_DIR / SUBDIRS[page_type]
+    existing = list(directory.glob(f"{prefix}*.md")) if directory.exists() else []
+    return len(existing) + 1
+
+
 def write_page(page_type: str, page_id: str, data: dict[str, Any]) -> Path:
     """Write a wiki page as YAML with a leading provenance comment."""
     target = page_path(page_type, page_id)
@@ -200,6 +208,8 @@ def build_index() -> dict[str, Any]:
             entry["confidence"] = data.get("confidence")
         if "asset_class" in data:
             entry["asset_class"] = data.get("asset_class")
+        if "decision_type" in data:
+            entry["decision_type"] = data.get("decision_type")
         entries.append(entry)
 
     index = {"schema_version": SCHEMA_VERSION, "generated_at": iso_now(), "pages": entries}

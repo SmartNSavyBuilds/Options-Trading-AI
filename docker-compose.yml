@@ -37,6 +37,20 @@ services:
       retries: 5
       start_period: 60s
 
+  wiki-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.wiki
+    container_name: options-wiki-ingest
+    env_file:
+      - .env
+    command: sh -lc "python -m wiki_tools.ingest && python -m wiki_tools.lint"
+    volumes:
+      - ./outputs:/app/outputs:ro
+      - ./raw:/app/raw:ro
+      - ./wiki:/app/wiki
+    restart: "no"
+
   options-gateway:
     build: .
     container_name: options-gateway

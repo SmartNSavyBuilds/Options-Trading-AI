@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY wiki_tools/requirements.txt ./wiki_tools/requirements.txt
+RUN pip install --upgrade pip \
+    && pip install -r wiki_tools/requirements.txt
+
+COPY wiki_tools ./wiki_tools
+
+# Volumes are mounted at runtime: /app/outputs (ro), /app/raw (ro), /app/wiki (rw).
+CMD ["python", "-m", "wiki_tools.ingest"]

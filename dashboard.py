@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -981,6 +982,367 @@ def _get_worker_health() -> tuple[str, str, str]:
     return f'Running ({age_min}m ago)', '#4ade80', ''
 
 
+# ── Operational health summary ─────────────────────────────────────────────
+
+# Human-readable explanations for control hold reasons written by
+# daily_control_check.py. Keep keys aligned with control_miss_reasons tokens.
+CONTROL_REASON_LABELS = {
+    'monitor_stale': 'Worker heartbeat is stale',
+    'monitor_stale_hold': 'Trading held because the worker heartbeat is stale',
+    'performance_stale': 'Performance data is stale',
+    'broker_auth_unauthorized': 'Broker authentication failed (401 Unauthorized)',
+    'concentration_breach': 'Position concentration limit breached',
+    'error_count_24h': 'Elevated execution errors in the last 24 hours',
+    'blocked_count_24h': 'Too many blocked orders in the last 24 hours',
+    'recent_expired_48h': 'Recently expired contracts detected',
+    'protective_exit_fill_rate': 'Protective exit fill rate is below the minimum',
+    'missing_required_inputs': 'Required input files are missing or empty',
+}
+
+# Reasons that must block trading rather than act as soft warnings.
+HARD_BLOCK_REASONS = {
+    'broker_auth_unauthorized',
+    'concentration_breach',
+    'missing_required_inputs',
+}
+
+
+def _humanize_reason(token: str) -> str:
+    token = str(token or '').strip()
+    if not token:
+        return ''
+    return CONTROL_REASON_LABELS.get(token, token.replace('_', ' ').capitalize())
+
+
+def _freshness(age_minutes: float | None, stale_after: float = 30.0) -> tuple[str, str]:
+    """Return (label, color) for a data age in minutes."""
+    if age_minutes is None:
+        return 'no data', '#f87171'
+    age = int(age_minutes)
+    if age_minutes >= stale_after:
+        return f'stale · {age}m old', '#fb923c'
+    if age < 1:
+        return 'fresh · just now', '#4ade80'
+    return f'fresh · {age}m old', '#4ade80'
+
+
+def _file_age_minutes(path: Path) -> float | None:
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    return max((time.time() - path.stat().st_mtime) / 60.0, 0.0)
+
+
+def build_operational_summary() -> dict:
+    """Single source of operator truth pulled from the newest artifacts.
+
+    Reads control audit, gate report, broker account, and monitor status, then
+    returns freshness, blockers, and the exact source file for each value.
+    """
+    summary: dict = {
+        'blockers': [],   # hard stops — trading should not proceed
+        'warnings': [],   # soft holds — review needed
+        'items': [],      # per-signal rows: (label, value, color, source, freshness_label, freshness_color)
+        'gate_verdict': 'unknown',
+    }
+
+    # Control audit (latest row)
+    control_path = OUTPUT_DIR / 'control_audit_latest.csv'
+    control_age = _file_age_minutes(control_path)
+    control_reasons: list[str] = []
+    control_miss = None
+    try:
+        if control_age is not None:
+            cdf = pd.read_csv(control_path)
+            if not cdf.empty:
+                crow = cdf.iloc[0]
+                control_miss = str(crow.get('control_miss', '')).strip().lower() in {'true', '1', 'yes'}
+                raw_reasons = str(crow.get('control_miss_reasons', '') or '')
+                control_reasons = [r for r in raw_reasons.split('|') if r.strip()]
+    except Exception:
+        pass
+
+    for token in control_reasons:
+        human = _humanize_reason(token)
+        if token in HARD_BLOCK_REASONS:
+            summary['blockers'].append(human)
+        else:
+            summary['warnings'].append(human)
+
+    # Gate report verdict
+    gate_path = OUTPUT_DIR / 'pre_live_gate_report.json'
+    gate_age = _file_age_minutes(gate_path)
+    gate_verdict = 'unknown'
+    try:
+        if gate_age is not None:
+            gate_data = json.loads(gate_path.read_text(encoding='utf-8'))
+            gate_verdict = str(gate_data.get('verdict', 'unknown')).lower()
+    except Exception:
+        pass
+    summary['gate_verdict'] = gate_verdict
+    if gate_verdict == 'fail':
+        summary['warnings'].append('Pre-live gate verdict is FAIL')
+
+    # Broker auth / connection
+    account_path = OUTPUT_DIR / 'broker_account_status.csv'
+    account_age = _file_age_minutes(account_path)
+    conn_status = 'unknown'
+    try:
+        if account_age is not None:
+            adf = pd.read_csv(account_path)
+            if not adf.empty:
+                conn_status = str(adf.iloc[0].get('connection_status', 'unknown')).strip().lower()
+    except Exception:
+        pass
+    if conn_status == 'unauthorized':
+        blocker = 'Broker authentication failed (401 Unauthorized)'
+        if blocker not in summary['blockers']:
+            summary['blockers'].append(blocker)
+
+    # Monitor heartbeat
+    monitor_path = OUTPUT_DIR / 'monitor_status.csv'
+    monitor_age = _file_age_minutes(monitor_path)
+
+    # Per-signal rows for the transparency strip
+    worker_fresh_label, worker_fresh_color = _freshness(monitor_age, stale_after=30.0)
+    summary['items'].append((
+        'Worker heartbeat',
+        worker_health_label,
+        worker_health_color,
+        'monitor_status.csv',
+        worker_fresh_label,
+        worker_fresh_color,
+    ))
+
+    conn_color = '#4ade80' if conn_status == 'connected' else ('#f87171' if conn_status in {'unauthorized', 'error'} else '#fb923c')
+    acct_fresh_label, acct_fresh_color = _freshness(account_age, stale_after=30.0)
+    summary['items'].append((
+        'Broker connection',
+        conn_status.title(),
+        conn_color,
+        'broker_account_status.csv',
+        acct_fresh_label,
+        acct_fresh_color,
+    ))
+
+    gate_color = '#4ade80' if gate_verdict == 'pass' else ('#f87171' if gate_verdict == 'fail' else '#fb923c')
+    gate_fresh_label, gate_fresh_color = _freshness(gate_age, stale_after=60.0)
+    summary['items'].append((
+        'Pre-live gate',
+        gate_verdict.title(),
+        gate_color,
+        'pre_live_gate_report.json',
+        gate_fresh_label,
+        gate_fresh_color,
+    ))
+
+    if control_miss is None:
+        control_label, control_color = 'No data', '#f87171'
+    elif control_miss:
+        control_label, control_color = 'Hold active', '#fb923c'
+    else:
+        control_label, control_color = 'Clear', '#4ade80'
+    ctrl_fresh_label, ctrl_fresh_color = _freshness(control_age, stale_after=60.0)
+    summary['items'].append((
+        'Control audit',
+        control_label,
+        control_color,
+        'control_audit_latest.csv',
+        ctrl_fresh_label,
+        ctrl_fresh_color,
+    ))
+
+    return summary
+
+
+def render_operational_summary(summary: dict) -> None:
+    """Render the operator truth panel: blockers, holds, and source transparency."""
+    blockers = summary.get('blockers', [])
+    warnings = summary.get('warnings', [])
+
+    if blockers:
+        headline_bg = 'rgba(127,29,29,0.55)'
+        headline_border = '#f87171'
+        headline_text = 'TRADING BLOCKED'
+        headline_color = '#fecaca'
+    elif warnings:
+        headline_bg = 'rgba(120,53,15,0.5)'
+        headline_border = '#fb923c'
+        headline_text = 'REVIEW NEEDED'
+        headline_color = '#fed7aa'
+    else:
+        headline_bg = 'rgba(6,78,59,0.5)'
+        headline_border = '#4ade80'
+        headline_text = 'ALL CLEAR'
+        headline_color = '#bbf7d0'
+
+    # Per-signal transparency cells
+    cells = ''
+    for label, value, color, source, fresh_label, fresh_color in summary.get('items', []):
+        cells += (
+            '<div style="flex:1;min-width:170px;background:rgba(15,23,42,0.6);'
+            'border:1px solid rgba(100,116,139,0.35);border-radius:10px;padding:8px 12px;">'
+            f'<div style="color:#94a3b8;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;">{label}</div>'
+            f'<div style="color:{color};font-weight:700;font-size:1.0rem;margin:2px 0;">{value}</div>'
+            f'<div style="color:{fresh_color};font-size:0.72rem;">{fresh_label}</div>'
+            f'<div style="color:#475569;font-size:0.68rem;margin-top:2px;">{source}</div>'
+            '</div>'
+        )
+
+    reasons_html = ''
+    if blockers or warnings:
+        items_html = ''
+        for b in blockers:
+            items_html += f'<li style="color:#fecaca;">{b} <span style="color:#f87171;font-size:0.72rem;">(blocker)</span></li>'
+        for w in warnings:
+            items_html += f'<li style="color:#fed7aa;">{w} <span style="color:#fb923c;font-size:0.72rem;">(hold)</span></li>'
+        reasons_html = (
+            '<ul style="margin:8px 0 0 0;padding-left:20px;font-size:0.85rem;line-height:1.5;">'
+            f'{items_html}</ul>'
+        )
+
+    st.markdown(
+        f"""
+        <div style="background:{headline_bg};border:1px solid {headline_border};
+                    border-radius:12px;padding:12px 16px;margin-bottom:12px;">
+            <div style="color:{headline_color};font-weight:800;font-size:1.05rem;
+                        letter-spacing:0.03em;margin-bottom:8px;">
+                Operational status: {headline_text}
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">{cells}</div>
+            {reasons_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+WIKI_DIR = PROJECT_DIR / 'wiki'
+
+
+def build_wiki_summary() -> dict:
+    """Read the operations wiki index and lint report for the Execution Desk.
+
+    Reads only index.json and lint_report.json (both plain JSON) so the
+    dashboard carries no YAML dependency. Returns a dict describing wiki
+    availability, open incidents, and the latest lint result.
+    """
+    summary = {
+        'available': False,
+        'open_incidents': [],
+        'lint': None,
+        'page_count': 0,
+        'generated_at': None,
+    }
+    index_path = WIKI_DIR / 'index.json'
+    if not index_path.exists():
+        return summary
+    try:
+        index = json.loads(index_path.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return summary
+
+    summary['available'] = True
+    pages = index.get('pages', [])
+    summary['page_count'] = len(pages)
+    summary['generated_at'] = index.get('generated_at')
+    summary['open_incidents'] = [
+        {
+            'id': page.get('id', ''),
+            'timestamp': page.get('timestamp', ''),
+            'summary': page.get('summary', ''),
+        }
+        for page in pages
+        if page.get('type') == 'incident' and str(page.get('status')) == 'open'
+    ]
+
+    lint_path = WIKI_DIR / 'lint_report.json'
+    if lint_path.exists():
+        try:
+            summary['lint'] = json.loads(lint_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            summary['lint'] = None
+    return summary
+
+
+def render_wiki_summary(summary: dict) -> None:
+    """Render the operations knowledge wiki panel on the Execution Desk."""
+    if not summary.get('available'):
+        st.info(
+            'Operations wiki has not been generated yet. Run the wiki ingest '
+            '(python -m wiki_tools.ingest) to populate it.'
+        )
+        return
+
+    open_incidents = summary.get('open_incidents', [])
+    lint = summary.get('lint') or {}
+    lint_errors = int(lint.get('errors', 0))
+    lint_warnings = int(lint.get('warnings', 0))
+
+    if open_incidents or lint_errors:
+        header_bg = 'rgba(120,53,15,0.5)'
+        header_border = '#fb923c'
+        header_color = '#fed7aa'
+        header_text = f'{len(open_incidents)} open incident(s)'
+    else:
+        header_bg = 'rgba(6,78,59,0.5)'
+        header_border = '#4ade80'
+        header_color = '#bbf7d0'
+        header_text = 'No open incidents'
+
+    freshness_note = ''
+    generated_at = summary.get('generated_at')
+    if generated_at:
+        try:
+            generated = datetime.fromisoformat(str(generated_at).replace('Z', '+00:00'))
+            if generated.tzinfo is None:
+                generated = generated.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - generated).total_seconds() / 60
+            fresh_color = '#4ade80' if age_min < 60 else ('#fb923c' if age_min < 1440 else '#f87171')
+            freshness_note = (
+                f'<span style="color:{fresh_color};font-size:0.75rem;">'
+                f'updated {int(age_min)} min ago</span>'
+            )
+        except ValueError:
+            pass
+
+    incidents_html = ''
+    for incident in open_incidents:
+        incidents_html += (
+            '<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(100,116,139,0.35);'
+            'border-radius:10px;padding:8px 12px;margin-top:6px;">'
+            f'<div style="color:#fed7aa;font-weight:700;font-size:0.85rem;">{incident.get("id", "")}</div>'
+            f'<div style="color:#94a3b8;font-size:0.72rem;">{incident.get("timestamp", "")}</div>'
+            f'<div style="color:#cbd5e1;font-size:0.82rem;margin-top:4px;">{incident.get("summary", "")}</div>'
+            '</div>'
+        )
+    if not incidents_html:
+        incidents_html = (
+            '<div style="color:#bbf7d0;font-size:0.85rem;margin-top:6px;">'
+            'Every recorded incident is resolved.</div>'
+        )
+
+    lint_color = '#f87171' if lint_errors else ('#fb923c' if lint_warnings else '#4ade80')
+    lint_text = f'{lint_errors} error(s), {lint_warnings} warning(s)'
+
+    st.markdown(
+        f"""
+        <div style="background:{header_bg};border:1px solid {header_border};
+                    border-radius:12px;padding:12px 16px;margin-bottom:12px;">
+            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:4px;">
+                <span style="color:{header_color};font-weight:800;font-size:1.0rem;letter-spacing:0.03em;">
+                    Knowledge wiki: {header_text}
+                </span>
+                <span style="color:#94a3b8;font-size:0.78rem;">{summary.get('page_count', 0)} pages</span>
+                {freshness_note}
+                <span style="color:{lint_color};font-size:0.78rem;">Lint: {lint_text}</span>
+            </div>
+            {incidents_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 build_info = _get_build_info()
 worker_health_label, worker_health_color, worker_health_note = _get_worker_health()
 
@@ -1007,6 +1369,12 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# Operator truth panel: blockers, holds, and per-signal source transparency.
+try:
+    render_operational_summary(build_operational_summary())
+except Exception as _op_err:
+    st.warning(f'Operational summary unavailable: {_op_err}')
 
 st.markdown(
     """
@@ -1873,6 +2241,12 @@ with news_tab:
 
 with auto_tab:
     runtime_settings = load_runtime_settings()
+
+    st.subheader('Operations Knowledge Wiki')
+    try:
+        render_wiki_summary(build_wiki_summary())
+    except Exception as _wiki_err:
+        st.warning(f'Wiki summary unavailable: {_wiki_err}')
 
     st.subheader('Autonomy Controls')
     control_left, control_right = st.columns([1.2, 1])

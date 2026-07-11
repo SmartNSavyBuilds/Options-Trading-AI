@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import common
+from . import discovery_quality
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -172,6 +173,16 @@ def generate_weekly_summary(week_of: str | None = None, author: str = "system") 
 
     link_ids = sorted(set(incident_ids + [str(n.get("id", "")) for n in regime_notes if n.get("id")]))
 
+    quality = discovery_quality.build_discovery_quality()
+    blocked_items = [
+        i for i in quality.get("items", [])
+        if str(i.get("status", "")) == "block"
+    ]
+    top_blockers = [
+        f"{i.get('ticker', '')}: {', '.join(i.get('meta', {}).get('blocked_reasons', [])) or 'below threshold'}"
+        for i in blocked_items[:3]
+    ]
+
     data = {
         "schema_version": common.SCHEMA_VERSION,
         "id": page_id,
@@ -186,6 +197,11 @@ def generate_weekly_summary(week_of: str | None = None, author: str = "system") 
         "regime_transitions": regime_transitions,
         "control_incidents": control_incidents,
         "upcoming_week": upcoming_week,
+        "discovery_quality_formula_version": quality.get("formula_version"),
+        "discovery_quality_avg_score": quality.get("avg_discovery_quality_score"),
+        "discovery_quality_pass_count": quality.get("pass_count"),
+        "discovery_quality_block_count": quality.get("block_count"),
+        "discovery_quality_top_blockers": top_blockers,
         "author": author,
         "links": link_ids,
     }

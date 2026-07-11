@@ -286,6 +286,8 @@ links: []
 - `outcome`: What actually happened. Absence past 7 days triggers the outcome follow-up warning.
 - `verdict`: One of `as_expected`, `better_than_expected`, `worse_than_expected`, `inconclusive`. Required once `outcome` is present so outcomes are comparable across decisions.
 - `outcome_updated_at`: ISO 8601 timestamp for the most recent outcome update.
+- `discovery_quality_score`: Deterministic 0-100 score captured at decision time from `wiki/discovery_quality.json`.
+- `discovery_quality_components`: Component breakdown (signal, regime alignment, execution reliability, concentration) so future analysis can audit why the score was high or low.
 
 **Lint Rules**:
 - `decision_type`: Must be one of the four allowed values.
@@ -349,6 +351,13 @@ links:
 - Completeness: All required fields must be non-empty
 - Freshness: One and only one weekly_summary per calendar week (flag duplicates)
 - Incident linkage: All incidents mentioned must have corresponding incident pages
+
+**Optional Analytics Fields**:
+- `discovery_quality_formula_version`: Formula version used for weekly discovery scoring (for reproducibility).
+- `discovery_quality_avg_score`: Weekly average discovery quality score.
+- `discovery_quality_pass_count`: Number of names above threshold and guardrail-pass.
+- `discovery_quality_block_count`: Number of names blocked by threshold or guardrail.
+- `discovery_quality_top_blockers`: Top blocked names and reasons.
 
 **Mutable Fields**: `links` only. Weekly summaries are a permanent record.
 

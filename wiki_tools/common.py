@@ -214,6 +214,14 @@ def build_index() -> dict[str, Any]:
             entry["outcome"] = data.get("outcome")
         if "verdict" in data:
             entry["verdict"] = data.get("verdict")
+        if "discovery_quality_score" in data:
+            entry["discovery_quality_score"] = data.get("discovery_quality_score")
+        if "discovery_quality_avg_score" in data:
+            entry["discovery_quality_avg_score"] = data.get("discovery_quality_avg_score")
+        if "discovery_quality_pass_count" in data:
+            entry["discovery_quality_pass_count"] = data.get("discovery_quality_pass_count")
+        if "discovery_quality_block_count" in data:
+            entry["discovery_quality_block_count"] = data.get("discovery_quality_block_count")
         entries.append(entry)
 
     index = {"schema_version": SCHEMA_VERSION, "generated_at": iso_now(), "pages": entries}

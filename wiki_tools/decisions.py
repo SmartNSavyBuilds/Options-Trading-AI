@@ -37,6 +37,8 @@ def record_decision(
     clears: list[str] | None = None,
     outcome: str = "",
     verdict: str = "",
+    discovery_quality_score: float | None = None,
+    discovery_quality_components: dict[str, float] | None = None,
 ) -> str:
     """Write a decision_log page and rebuild the index. Returns the page id."""
     if decision_type not in DECISION_TYPES:
@@ -76,6 +78,10 @@ def record_decision(
         "verdict": verdict.strip(),
         "links": list(links or []),
     }
+    if discovery_quality_score is not None:
+        data["discovery_quality_score"] = float(discovery_quality_score)
+    if discovery_quality_components:
+        data["discovery_quality_components"] = dict(discovery_quality_components)
 
     common.write_page("decision_log", page_id, data)
     cleared_note = f" (clears {', '.join(data['clears'])})" if data["clears"] else ""
@@ -93,6 +99,12 @@ def main() -> None:
     parser.add_argument("--expected", dest="expected_outcome", default="")
     parser.add_argument("--outcome", default="")
     parser.add_argument("--verdict", default="", choices=("",) + DECISION_VERDICTS)
+    parser.add_argument(
+        "--discovery-quality-score",
+        type=float,
+        default=None,
+        help="Optional deterministic discovery quality score used at decision time",
+    )
     parser.add_argument("--links", nargs="*", default=[])
     parser.add_argument(
         "--clears",
@@ -112,6 +124,7 @@ def main() -> None:
         clears=args.clears,
         outcome=args.outcome,
         verdict=args.verdict,
+        discovery_quality_score=args.discovery_quality_score,
     )
     print(f"Recorded {page_id}")
 

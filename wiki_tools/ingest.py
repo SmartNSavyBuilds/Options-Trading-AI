@@ -9,6 +9,7 @@ day and the same set of control reasons does not create duplicate pages.
 from __future__ import annotations
 
 from . import common
+from . import discovery_quality
 
 
 def _incident_signature(date: str, reasons: list[str]) -> str:
@@ -287,6 +288,11 @@ def main() -> None:
             continue
         written.append(ingest_regime_note(snapshot))
         written.append(ingest_strategy_thesis(snapshot))
+
+    quality = discovery_quality.build_discovery_quality()
+    written.append(
+        f"discovery_quality(avg={quality['avg_discovery_quality_score']},pass={quality['pass_count']},block={quality['block_count']})"
+    )
 
     common.build_index()
     if written:

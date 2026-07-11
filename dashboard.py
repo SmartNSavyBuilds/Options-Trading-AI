@@ -1349,6 +1349,19 @@ def build_wiki_summary() -> dict:
             }
         )
     summary['regime_memory'] = regime_memory
+
+    quality_path = WIKI_DIR / 'discovery_quality.json'
+    if quality_path.exists():
+        try:
+            quality = json.loads(quality_path.read_text(encoding='utf-8'))
+            summary['discovery_quality'] = {
+                'avg': quality.get('avg_discovery_quality_score', 0),
+                'pass_count': quality.get('pass_count', 0),
+                'block_count': quality.get('block_count', 0),
+                'formula_version': quality.get('formula_version', ''),
+            }
+        except (json.JSONDecodeError, OSError):
+            summary['discovery_quality'] = None
     return summary
 
 
@@ -1426,6 +1439,17 @@ def render_wiki_summary(summary: dict) -> None:
     pending_note = (
         f'<span style="color:{pending_color};font-size:0.78rem;">'
         f'Outcomes pending: {outcomes_pending}</span>'
+    )
+
+    quality = summary.get('discovery_quality') or {}
+    quality_avg = float(quality.get('avg', 0) or 0)
+    quality_pass = int(quality.get('pass_count', 0) or 0)
+    quality_block = int(quality.get('block_count', 0) or 0)
+    quality_color = '#4ade80' if quality_avg >= 70 else ('#fb923c' if quality_avg >= 55 else '#f87171')
+    quality_note = (
+        f'<span style="color:{quality_color};font-size:0.78rem;">'
+        f'Discovery quality: {quality_avg:.1f} ({quality_pass} pass / {quality_block} block)'
+        '</span>'
     )
 
     # Recent decision log entries.
@@ -1557,6 +1581,7 @@ def render_wiki_summary(summary: dict) -> None:
                 <span style="color:{lint_color};font-size:0.78rem;">Lint: {lint_text}</span>
                 {flags_note}
                 {pending_note}
+                {quality_note}
             </div>
             {context_html}
             {regime_memory_html}

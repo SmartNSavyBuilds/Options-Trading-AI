@@ -210,6 +210,10 @@ def build_index() -> dict[str, Any]:
             entry["asset_class"] = data.get("asset_class")
         if "decision_type" in data:
             entry["decision_type"] = data.get("decision_type")
+        if "outcome" in data:
+            entry["outcome"] = data.get("outcome")
+        if "verdict" in data:
+            entry["verdict"] = data.get("verdict")
         entries.append(entry)
 
     index = {"schema_version": SCHEMA_VERSION, "generated_at": iso_now(), "pages": entries}

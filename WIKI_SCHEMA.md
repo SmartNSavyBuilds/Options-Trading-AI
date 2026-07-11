@@ -284,6 +284,8 @@ links: []
 **Optional Fields**:
 - `clears`: List of lint flag ids this decision resolves (e.g., `review:strategy_thesis_crypto_mixed`, `contradiction:crypto:mixed`). A cleared flag is downgraded from a warning to an acknowledged note that records this decision, so operator judgement stops the nag while staying auditable.
 - `outcome`: What actually happened. Absence past 7 days triggers the outcome follow-up warning.
+- `verdict`: One of `as_expected`, `better_than_expected`, `worse_than_expected`, `inconclusive`. Required once `outcome` is present so outcomes are comparable across decisions.
+- `outcome_updated_at`: ISO 8601 timestamp for the most recent outcome update.
 
 **Lint Rules**:
 - `decision_type`: Must be one of the four allowed values.
@@ -291,7 +293,7 @@ links: []
 - Outcome tracking: Flag decisions older than 7 days with no `outcome` (needs follow-up).
 - Flag clearing: Any `flag_id` listed in `clears` suppresses the matching warning (contradiction, unreviewed thesis) and marks it acknowledged.
 
-**Mutable Fields**: `links` only. Decisions are a permanent audit record; add a follow-up decision_log rather than editing.
+**Mutable Fields**: `links`, `outcome`, `verdict`, `outcome_updated_at`. The decision itself is immutable; only post-decision outcome tracking fields can be updated.
 
 **Example**:
 ```yaml
@@ -316,6 +318,8 @@ expected_outcome: |
 clears:
   - review:strategy_thesis_options_mixed
 outcome: ''
+verdict: as_expected
+outcome_updated_at: 2026-07-11T03:04:12+00:00
 links:
   - incident_2026-07-10_001
 ```

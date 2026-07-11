@@ -1295,12 +1295,14 @@ def build_wiki_summary() -> dict:
 
     decisions = [p for p in pages if p.get('type') == 'decision_log']
     decisions.sort(key=lambda p: str(p.get('timestamp', '')), reverse=True)
+    summary['outcomes_pending'] = sum(1 for p in decisions if not str(p.get('outcome', '')).strip())
     summary['recent_decisions'] = [
         {
             'id': p.get('id', ''),
             'decision_type': p.get('decision_type', ''),
             'summary': p.get('summary', ''),
             'timestamp': p.get('timestamp', ''),
+            'verdict': p.get('verdict', ''),
         }
         for p in decisions[:3]
     ]
@@ -1376,6 +1378,13 @@ def render_wiki_summary(summary: dict) -> None:
         flag_label += f', {flags_ack} acknowledged'
     flags_note = f'<span style="color:{flag_color};font-size:0.78rem;">{flag_label}</span>'
 
+    outcomes_pending = int(summary.get('outcomes_pending', 0))
+    pending_color = '#fb923c' if outcomes_pending else '#4ade80'
+    pending_note = (
+        f'<span style="color:{pending_color};font-size:0.78rem;">'
+        f'Outcomes pending: {outcomes_pending}</span>'
+    )
+
     # Recent decision log entries.
     decision_labels = {
         'trade': 'Trade',
@@ -1392,11 +1401,20 @@ def render_wiki_summary(summary: dict) -> None:
                 decision.get('decision_type', ''),
                 str(decision.get('decision_type', '')).replace('_', ' ').title(),
             )
+            verdict = str(decision.get('verdict', '')).strip()
+            verdict_label = verdict.replace('_', ' ').title() if verdict else 'Pending outcome'
+            verdict_color = {
+                'as_expected': '#4ade80',
+                'better_than_expected': '#22c55e',
+                'worse_than_expected': '#f87171',
+                'inconclusive': '#94a3b8',
+            }.get(verdict, '#fb923c')
             rows += (
                 '<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(100,116,139,0.35);'
                 'border-radius:10px;padding:6px 12px;margin-top:6px;">'
                 f'<div style="color:#93c5fd;font-weight:700;font-size:0.8rem;">{label}'
-                f'<span style="color:#64748b;font-weight:400;"> &middot; {decision.get("timestamp", "")}</span></div>'
+                f'<span style="color:#64748b;font-weight:400;"> &middot; {decision.get("timestamp", "")}</span>'
+                f'<span style="margin-left:8px;color:{verdict_color};font-weight:600;">{verdict_label}</span></div>'
                 f'<div style="color:#cbd5e1;font-size:0.8rem;margin-top:2px;">{decision.get("summary", "")}</div>'
                 '</div>'
             )
@@ -1451,6 +1469,7 @@ def render_wiki_summary(summary: dict) -> None:
                 {freshness_note}
                 <span style="color:{lint_color};font-size:0.78rem;">Lint: {lint_text}</span>
                 {flags_note}
+                {pending_note}
             </div>
             {context_html}
             {incidents_html}

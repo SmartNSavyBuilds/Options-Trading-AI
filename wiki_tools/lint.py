@@ -18,6 +18,7 @@ from . import common
 INCIDENT_STALE_HOURS = 24
 DECISION_STALE_DAYS = 7
 DECISION_TYPES = ("trade", "override_control", "strategy_shift", "investigation_result")
+DECISION_VERDICTS = ("as_expected", "better_than_expected", "worse_than_expected", "inconclusive")
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -175,7 +176,23 @@ def _check_decision_logs(
                     _finding(page_id, "warn", "linkage", f"Linked page '{linked}' does not exist")
                 )
         parsed = _parse_iso(data.get("timestamp"))
-        if parsed is not None and not str(data.get("outcome", "")).strip():
+        outcome_text = str(data.get("outcome", "")).strip()
+        verdict = str(data.get("verdict", "")).strip()
+        if verdict and verdict not in DECISION_VERDICTS:
+            findings.append(
+                _finding(
+                    page_id,
+                    "error",
+                    "verdict",
+                    f"Invalid verdict '{verdict}' (expected one of {', '.join(DECISION_VERDICTS)})",
+                )
+            )
+        if outcome_text and not verdict:
+            findings.append(
+                _finding(page_id, "warn", "verdict", "Outcome is set but verdict is missing")
+            )
+
+        if parsed is not None and not outcome_text:
             age_days = (now - parsed).total_seconds() / 86400
             if age_days > DECISION_STALE_DAYS:
                 findings.append(
@@ -201,7 +218,7 @@ def _apply_cleared(
         flag_id = finding.get("flag_id")
         if flag_id and flag_id in cleared:
             finding["level"] = "info"
-            finding["message"] += f" — acknowledged by {cleared[flag_id]}"
+            finding["message"] += f" - acknowledged by {cleared[flag_id]}"
     return findings
 
 

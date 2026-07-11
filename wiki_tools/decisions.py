@@ -24,6 +24,7 @@ import argparse
 from . import common
 
 DECISION_TYPES = ("trade", "override_control", "strategy_shift", "investigation_result")
+DECISION_VERDICTS = ("as_expected", "better_than_expected", "worse_than_expected", "inconclusive")
 
 
 def record_decision(
@@ -35,6 +36,7 @@ def record_decision(
     links: list[str] | None = None,
     clears: list[str] | None = None,
     outcome: str = "",
+    verdict: str = "",
 ) -> str:
     """Write a decision_log page and rebuild the index. Returns the page id."""
     if decision_type not in DECISION_TYPES:
@@ -47,6 +49,12 @@ def record_decision(
         raise ValueError("rationale is required")
     if not owner.strip():
         raise ValueError("owner is required")
+    if verdict and verdict not in DECISION_VERDICTS:
+        raise ValueError(
+            f"verdict '{verdict}' is not one of {', '.join(DECISION_VERDICTS)}"
+        )
+    if outcome.strip() and not verdict:
+        raise ValueError("verdict is required when outcome is set")
 
     common.ensure_dirs()
     date = common.today_utc()
@@ -65,6 +73,7 @@ def record_decision(
         "expected_outcome": expected_outcome.strip(),
         "clears": list(clears or []),
         "outcome": outcome.strip(),
+        "verdict": verdict.strip(),
         "links": list(links or []),
     }
 
@@ -83,6 +92,7 @@ def main() -> None:
     parser.add_argument("--owner", required=True)
     parser.add_argument("--expected", dest="expected_outcome", default="")
     parser.add_argument("--outcome", default="")
+    parser.add_argument("--verdict", default="", choices=("",) + DECISION_VERDICTS)
     parser.add_argument("--links", nargs="*", default=[])
     parser.add_argument(
         "--clears",
@@ -101,6 +111,7 @@ def main() -> None:
         links=args.links,
         clears=args.clears,
         outcome=args.outcome,
+        verdict=args.verdict,
     )
     print(f"Recorded {page_id}")
 

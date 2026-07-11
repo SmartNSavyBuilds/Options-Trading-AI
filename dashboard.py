@@ -1306,6 +1306,49 @@ def build_wiki_summary() -> dict:
         }
         for p in decisions[:3]
     ]
+
+    note_by_id = {
+        str(p.get('id', '')): p
+        for p in regime_notes
+        if p.get('id')
+    }
+    regime_memory = []
+    for entry in asset_regimes:
+        asset = str(entry.get('asset_class', 'options'))
+        regime_name = str(entry.get('regime', ''))
+        if not regime_name:
+            continue
+
+        matched = []
+        for decision in decisions:
+            for link in decision.get('links', []) or []:
+                note = note_by_id.get(str(link))
+                if note is None:
+                    continue
+                note_asset = str(note.get('asset_class', 'options'))
+                note_regime = str(note.get('regime', ''))
+                if note_asset == asset and note_regime == regime_name:
+                    matched.append(
+                        {
+                            'id': decision.get('id', ''),
+                            'decision_type': decision.get('decision_type', ''),
+                            'timestamp': decision.get('timestamp', ''),
+                            'summary': decision.get('summary', ''),
+                            'verdict': decision.get('verdict', ''),
+                        }
+                    )
+                    break
+
+        matched.sort(key=lambda d: str(d.get('timestamp', '')), reverse=True)
+        regime_memory.append(
+            {
+                'asset_class': asset,
+                'regime': regime_name,
+                'decision_count': len(matched),
+                'recent': matched[:3],
+            }
+        )
+    summary['regime_memory'] = regime_memory
     return summary
 
 
@@ -1424,6 +1467,50 @@ def render_wiki_summary(summary: dict) -> None:
             f'{rows}</div>'
         )
 
+    # Comparable-regime memory from linked historical decisions.
+    memory_cards = ''
+    for item in summary.get('regime_memory') or []:
+        asset_label = str(item.get('asset_class', 'options')).replace('_', ' ').title()
+        regime_name = str(item.get('regime', ''))
+        count = int(item.get('decision_count', 0))
+        snippets = ''
+        for dec in item.get('recent', []):
+            verdict = str(dec.get('verdict', '')).strip()
+            verdict_label = verdict.replace('_', ' ').title() if verdict else 'Pending outcome'
+            verdict_color = {
+                'as_expected': '#4ade80',
+                'better_than_expected': '#22c55e',
+                'worse_than_expected': '#f87171',
+                'inconclusive': '#94a3b8',
+            }.get(verdict, '#fb923c')
+            snippets += (
+                '<div style="margin-top:4px;padding-top:4px;border-top:1px dashed rgba(100,116,139,0.3);">'
+                f'<div style="color:#93c5fd;font-size:0.76rem;">{dec.get("decision_type", "").replace("_", " ").title()}'
+                f' &middot; {dec.get("timestamp", "")}</div>'
+                f'<div style="color:{verdict_color};font-size:0.74rem;font-weight:600;">{verdict_label}</div>'
+                '</div>'
+            )
+        if not snippets:
+            snippets = '<div style="color:#94a3b8;font-size:0.76rem;margin-top:4px;">No linked decisions yet.</div>'
+
+        memory_cards += (
+            '<div style="flex:1;min-width:220px;background:rgba(15,23,42,0.6);'
+            'border:1px solid rgba(100,116,139,0.35);border-radius:10px;padding:8px 12px;">'
+            f'<div style="color:#94a3b8;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;">{asset_label} memory</div>'
+            f'<div style="color:#e2e8f0;font-weight:700;font-size:0.9rem;">{regime_name}</div>'
+            f'<div style="color:#94a3b8;font-size:0.75rem;">{count} linked decisions in similar regime</div>'
+            f'{snippets}'
+            '</div>'
+        )
+    regime_memory_html = ''
+    if memory_cards:
+        regime_memory_html = (
+            '<div style="margin-top:8px;">'
+            '<div style="color:#94a3b8;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;">Regime memory</div>'
+            f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">{memory_cards}</div>'
+            '</div>'
+        )
+
     # Per-asset market regime and thesis conviction cells.
     asset_regimes = summary.get('asset_regimes') or []
     context_html = ''
@@ -1472,6 +1559,7 @@ def render_wiki_summary(summary: dict) -> None:
                 {pending_note}
             </div>
             {context_html}
+            {regime_memory_html}
             {incidents_html}
             {decisions_html}
         </div>

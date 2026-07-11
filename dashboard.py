@@ -1255,6 +1255,33 @@ def build_wiki_summary() -> dict:
         if page.get('type') == 'incident' and str(page.get('status')) == 'open'
     ]
 
+    regime_notes = [p for p in pages if p.get('type') == 'regime_note']
+    theses = [p for p in pages if p.get('type') == 'strategy_thesis']
+    # One regime cell per asset class, paired with its matching thesis conviction.
+    asset_regimes = []
+    assets = sorted({str(p.get('asset_class', 'options')) for p in regime_notes})
+    for asset in assets:
+        asset_notes = [p for p in regime_notes if str(p.get('asset_class', 'options')) == asset]
+        if not asset_notes:
+            continue
+        latest_regime = max(asset_notes, key=lambda p: str(p.get('timestamp', '')))
+        regime_name = latest_regime.get('regime', '')
+        match = [
+            p for p in theses
+            if str(p.get('asset_class', 'options')) == asset and p.get('regime') == regime_name
+        ]
+        confidence = None
+        if match:
+            confidence = max(match, key=lambda p: str(p.get('timestamp', ''))).get('confidence')
+        asset_regimes.append({
+            'asset_class': asset,
+            'regime': regime_name,
+            'summary': latest_regime.get('summary', ''),
+            'timestamp': latest_regime.get('timestamp', ''),
+            'confidence': confidence,
+        })
+    summary['asset_regimes'] = asset_regimes
+
     lint_path = WIKI_DIR / 'lint_report.json'
     if lint_path.exists():
         try:
@@ -1324,6 +1351,39 @@ def render_wiki_summary(summary: dict) -> None:
     lint_color = '#f87171' if lint_errors else ('#fb923c' if lint_warnings else '#4ade80')
     lint_text = f'{lint_errors} error(s), {lint_warnings} warning(s)'
 
+    # Per-asset market regime and thesis conviction cells.
+    asset_regimes = summary.get('asset_regimes') or []
+    context_html = ''
+    context_cells = ''
+    for entry in asset_regimes:
+        regime_name = entry.get('regime', '')
+        if not regime_name:
+            continue
+        asset_label = str(entry.get('asset_class', 'options')).replace('_', ' ').title()
+        conf = entry.get('confidence')
+        if conf is not None:
+            conf = int(conf)
+            conf_color = '#4ade80' if conf >= 60 else ('#fb923c' if conf >= 40 else '#f87171')
+            conf_html = (
+                f'<div style="color:{conf_color};font-weight:700;font-size:0.95rem;margin-top:4px;">'
+                f'Conviction {conf}/100</div>'
+            )
+        else:
+            conf_html = (
+                '<div style="color:#94a3b8;font-size:0.75rem;margin-top:4px;">No thesis yet</div>'
+            )
+        context_cells += (
+            '<div style="flex:1;min-width:200px;background:rgba(15,23,42,0.6);'
+            'border:1px solid rgba(100,116,139,0.35);border-radius:10px;padding:8px 12px;">'
+            f'<div style="color:#94a3b8;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;">{asset_label} regime</div>'
+            f'<div style="color:#e2e8f0;font-weight:700;font-size:0.95rem;margin:2px 0;">{regime_name}</div>'
+            f'<div style="color:#94a3b8;font-size:0.75rem;">{entry.get("summary", "")}</div>'
+            f'{conf_html}'
+            '</div>'
+        )
+    if context_cells:
+        context_html = f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">{context_cells}</div>'
+
     st.markdown(
         f"""
         <div style="background:{header_bg};border:1px solid {header_border};
@@ -1336,6 +1396,7 @@ def render_wiki_summary(summary: dict) -> None:
                 {freshness_note}
                 <span style="color:{lint_color};font-size:0.78rem;">Lint: {lint_text}</span>
             </div>
+            {context_html}
             {incidents_html}
         </div>
         """,

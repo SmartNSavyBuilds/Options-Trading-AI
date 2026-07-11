@@ -87,13 +87,60 @@ def _check_page(page_type: str, path: Path, data: dict[str, Any]) -> list[dict[s
     return findings
 
 
+def _check_contradiction(
+    regime_notes: list[dict[str, Any]], theses: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+    """Cheap hard-rule contradiction check (schema global rule 6).
+
+    Per asset class: flags when the most recent regime note's regime has no
+    matching strategy thesis for the same asset class. Warn-only; clearing
+    requires a decision_log entry.
+    """
+    findings: list[dict[str, str]] = []
+    by_asset: dict[str, list[dict[str, Any]]] = {}
+    for note in regime_notes:
+        by_asset.setdefault(str(note.get("asset_class", "unknown")), []).append(note)
+
+    for asset, notes in by_asset.items():
+        latest = max(notes, key=lambda d: str(d.get("timestamp", "")))
+        current_regime = str(latest.get("regime", "")).strip()
+        if not current_regime:
+            continue
+        asset_thesis_regimes = {
+            str(t.get("regime"))
+            for t in theses
+            if str(t.get("asset_class", "unknown")) == asset and t.get("regime")
+        }
+        if not asset_thesis_regimes:
+            continue
+        if current_regime not in asset_thesis_regimes:
+            findings.append(
+                _finding(
+                    latest.get("id", "regime_note"),
+                    "warn",
+                    "contradiction",
+                    f"[{asset}] current regime '{current_regime}' has no matching thesis "
+                    f"(theses cover: {', '.join(sorted(asset_thesis_regimes))})",
+                )
+            )
+    return findings
+
+
 def run() -> dict[str, Any]:
     common.ensure_dirs()
     findings: list[dict[str, str]] = []
     page_count = 0
+    regime_notes: list[dict[str, Any]] = []
+    theses: list[dict[str, Any]] = []
     for page_type, path, data in common.iter_pages():
         page_count += 1
         findings.extend(_check_page(page_type, path, data))
+        if page_type == "regime_note":
+            regime_notes.append(data)
+        elif page_type == "strategy_thesis":
+            theses.append(data)
+
+    findings.extend(_check_contradiction(regime_notes, theses))
 
     errors = sum(1 for f in findings if f["level"] == "error")
     warnings = sum(1 for f in findings if f["level"] == "warn")

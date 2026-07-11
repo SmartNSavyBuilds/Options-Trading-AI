@@ -126,11 +126,37 @@ def iter_pages() -> Iterator[tuple[str, Path, dict[str, Any]]]:
 
 def load_control_latest() -> dict[str, str] | None:
     """Read the single-row control_audit_latest.csv as a dict, or None."""
-    if not CONTROL_LATEST_FILE.exists():
+    return load_csv_row(CONTROL_LATEST_FILE)
+
+
+def load_csv_row(path: Path) -> dict[str, str] | None:
+    """Read the first row of a CSV as a dict, or None if missing/empty."""
+    if not path.exists():
         return None
-    with CONTROL_LATEST_FILE.open("r", encoding="utf-8", newline="") as handle:
+    with path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     return rows[0] if rows else None
+
+
+def load_csv_rows(path: Path) -> list[dict[str, str]]:
+    """Read all rows of a CSV as a list of dicts (empty list if missing)."""
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def top_exposures(limit: int = 3) -> list[dict[str, str]]:
+    """Return the largest holdings from exposure_summary.csv by exposure_pct."""
+    rows = load_csv_rows(OUTPUTS_DIR / "exposure_summary.csv")
+
+    def _pct(row: dict[str, str]) -> float:
+        try:
+            return float(row.get("exposure_pct", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return sorted(rows, key=_pct, reverse=True)[:limit]
 
 
 def as_bool(value: Any) -> bool:
@@ -158,17 +184,23 @@ def build_index() -> dict[str, Any]:
         summary_text = " ".join(str(summary_text).split())
         if len(summary_text) > 220:
             summary_text = summary_text[:217] + "..."
-        entries.append(
-            {
-                "id": data.get("id", path.stem),
-                "type": page_type,
-                "timestamp": data.get("timestamp") or data.get("last_updated") or data.get("week_of"),
-                "status": data.get("status", ""),
-                "summary": summary_text,
-                "links": data.get("links", []) or [],
-                "path": str(path.relative_to(WIKI_DIR)).replace(os.sep, "/"),
-            }
-        )
+        entry = {
+            "id": data.get("id", path.stem),
+            "type": page_type,
+            "timestamp": data.get("timestamp") or data.get("last_updated") or data.get("week_of"),
+            "status": data.get("status", ""),
+            "summary": summary_text,
+            "links": data.get("links", []) or [],
+            "path": str(path.relative_to(WIKI_DIR)).replace(os.sep, "/"),
+        }
+        # Pass through a couple of typed fields the dashboard reads directly.
+        if "regime" in data:
+            entry["regime"] = data.get("regime")
+        if "confidence" in data:
+            entry["confidence"] = data.get("confidence")
+        if "asset_class" in data:
+            entry["asset_class"] = data.get("asset_class")
+        entries.append(entry)
 
     index = {"schema_version": SCHEMA_VERSION, "generated_at": iso_now(), "pages": entries}
     (WIKI_DIR / "index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")

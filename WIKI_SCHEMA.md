@@ -16,6 +16,10 @@ Every page, regardless of type, must include these three fields:
 - `id`: Stable unique identifier for the page, independent of filename (e.g., `incident_2026-07-10_001`). Ingest and lint key off this, never off filename parsing.
 - `links`: List of related page ids (may be empty `[]`). Satisfies orphan detection and lets any page point to its thesis, playbook, or source incident.
 
+### Optional cross-cutting field
+
+- `asset_class`: The asset class a page describes (e.g., `options`, `crypto`). Optional and additive; pages without it are treated as `options`. Regime notes and strategy theses use it to keep one regime/thesis per asset class so multi-asset books do not collide.
+
 ---
 
 ## Page Types
@@ -393,8 +397,10 @@ Applied to all page types:
    - Any flag requires a `decision_log` entry to clear. Start warn-only.
 7. **Naming Consistency**: Filenames follow these patterns by category:
    - Time-series pages (incident, decision_log): `{type}_{YYYY-MM-DD}_{seq}.md`
-   - Daily singletons (regime_note, weekly_summary): `{type}_{YYYY-MM-DD}.md`
-   - Named singletons (control_rule, strategy_thesis, playbook): `{type}_{slug}.md`
+   - Daily singletons (weekly_summary): `{type}_{YYYY-MM-DD}.md`
+   - Per-asset daily singletons (regime_note): `{type}_{asset_class}_{YYYY-MM-DD}.md`
+   - Per-asset named singletons (strategy_thesis): `{type}_{asset_class}_{regime}.md`
+   - Named singletons (control_rule, playbook): `{type}_{slug}.md`
    - Filenames never embed the record's own type value (e.g., no `control_miss` in an incident filename); the `id` field is the stable key.
 8. **Schema Version Check**: Every page must carry `schema_version`; lint rejects pages missing it and warns when a page lags the current version.
 
@@ -408,8 +414,8 @@ wiki/
   index.json                            # Generated query index (id, type, timestamp, status, links)
   incidents/                            # incident_YYYY-MM-DD_NNN.md
   control_rules/                        # control_rule_{slug}.md
-  strategy_theses/                      # strategy_thesis_{slug}.md
-  regime_notes/                         # regime_note_YYYY-MM-DD.md
+  strategy_theses/                      # strategy_thesis_{asset_class}_{regime}.md
+  regime_notes/                         # regime_note_{asset_class}_YYYY-MM-DD.md
   playbooks/                            # playbook_{slug}.md
   decision_logs/                        # decision_log_YYYY-MM-DD_NNN.md
   weekly_summaries/                     # weekly_summary_YYYY-MM-DD.md

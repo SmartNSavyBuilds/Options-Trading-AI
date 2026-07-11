@@ -92,6 +92,37 @@ def _check_page(page_type: str, path: Path, data: dict[str, Any]) -> list[dict[s
                         _finding(rel, "warn", "staleness", f"Open incident is {age_hours:.0f}h old (> {INCIDENT_STALE_HOURS}h)")
                     )
 
+    if page_type == "weekly_summary":
+        required_fields = (
+            "week_of",
+            "net_pnl",
+            "currency",
+            "win_ratio",
+            "trades_closed",
+            "biggest_win",
+            "biggest_loss",
+            "themes",
+            "regime_transitions",
+            "control_incidents",
+            "upcoming_week",
+            "author",
+        )
+        for field in required_fields:
+            value = data.get(field)
+            if value in (None, ""):
+                findings.append(_finding(rel, "error", "completeness", f"Missing required field '{field}'"))
+
+        for field in ("themes", "control_incidents", "upcoming_week"):
+            value = data.get(field)
+            if not isinstance(value, list) or not value:
+                findings.append(_finding(rel, "error", "completeness", f"Field '{field}' must be a non-empty list"))
+
+        try:
+            week_of = str(data.get("week_of", ""))
+            datetime.fromisoformat(f"{week_of}T00:00:00+00:00")
+        except ValueError:
+            findings.append(_finding(rel, "error", "week_of", "week_of must be an ISO date (YYYY-MM-DD)"))
+
     return findings
 
 
@@ -206,6 +237,29 @@ def _check_decision_logs(
     return findings
 
 
+def _check_weekly_duplicates(weekly_summaries: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Flag duplicate weekly_summary pages for the same week_of."""
+    by_week: dict[str, list[str]] = {}
+    for summary in weekly_summaries:
+        week = str(summary.get("week_of", "")).strip()
+        if not week:
+            continue
+        by_week.setdefault(week, []).append(str(summary.get("id", "weekly_summary")))
+
+    findings: list[dict[str, str]] = []
+    for week, ids in by_week.items():
+        if len(ids) > 1:
+            findings.append(
+                _finding(
+                    ",".join(sorted(ids)),
+                    "warn",
+                    "freshness",
+                    f"Multiple weekly_summary pages found for week_of {week}: {', '.join(sorted(ids))}",
+                )
+            )
+    return findings
+
+
 def _apply_cleared(
     findings: list[dict[str, str]], cleared: dict[str, str]
 ) -> list[dict[str, str]]:
@@ -229,6 +283,7 @@ def run() -> dict[str, Any]:
     regime_notes: list[dict[str, Any]] = []
     theses: list[dict[str, Any]] = []
     decision_logs: list[dict[str, Any]] = []
+    weekly_summaries: list[dict[str, Any]] = []
     all_ids: set[str] = set()
     cleared: dict[str, str] = {}
     for page_type, path, data in common.iter_pages():
@@ -244,10 +299,13 @@ def run() -> dict[str, Any]:
             decision_logs.append(data)
             for flag_id in data.get("clears", []) or []:
                 cleared[str(flag_id)] = str(data.get("id", "decision_log"))
+        elif page_type == "weekly_summary":
+            weekly_summaries.append(data)
 
     findings.extend(_check_contradiction(regime_notes, theses))
     findings.extend(_check_unreviewed_theses(theses))
     findings.extend(_check_decision_logs(decision_logs, all_ids))
+    findings.extend(_check_weekly_duplicates(weekly_summaries))
     _apply_cleared(findings, cleared)
 
     errors = sum(1 for f in findings if f["level"] == "error")

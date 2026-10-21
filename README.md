@@ -1,6 +1,12 @@
-# Options Trading AI — Autonomous Research & Execution Dashboard
+# Options Trading AI
 
-> **Paper-first autonomous trading system** — signal scanning, options candidate ranking, risk management, broker execution, and a professional multi-tab research dashboard. Built end-to-end in Python with Alpaca broker integration.
+**Paper-first research and execution dashboard for options workflows.** It scans market data, ranks candidate setups, applies portfolio and concentration guardrails, journals paper performance, and presents the operational picture in a multi-tab Streamlit dashboard. Built in Python with Streamlit, Plotly, pandas, yfinance, and Alpaca paper-broker integration.
+
+> This repository is for research and paper trading only. It does not place live trades and is not financial advice.
+
+- [Security](SECURITY.md)
+- [Disclaimer](DISCLAIMER.md)
+- [Contributing](CONTRIBUTING.md)
 
 ---
 
@@ -11,7 +17,7 @@ This project runs a continuous autonomous pipeline that:
 1. **Scans the market** — scores equities and ETFs using a multi-factor signal engine (trend, momentum, RSI, volume, relative strength)
 2. **Ranks options candidates** — selects structure (long call, bull call spread, bear put spread, etc.) based on signal conviction and volatility
 3. **Manages risk** — enforces exposure caps, sector limits, correlation buckets, and stress scenarios before any order enters the queue
-4. **Executes paper trades autonomously** — routes approved ideas to an Alpaca paper account on a 15-minute cycle
+4. **Supports paper execution** — eligible ideas can be routed to an Alpaca paper account; execution interval and approval posture are configurable
 5. **Monitors exits** — evaluates stop-loss, take-profit, and time-decay thresholds; auto-approves urgent exits
 6. **Journals performance** — tracks every open position's P&L, execution style, and decision context
 7. **Surfaces intelligence** — congressional disclosures feed, catalyst news, market regime analysis, and a crypto watchlist inside a Streamlit dashboard
@@ -40,7 +46,7 @@ This project runs a continuous autonomous pipeline that:
 - **Alpaca Markets API** — paper broker execution, position sync, order management
 - **yfinance** — market data ingestion
 - **pandas / numpy** — data pipeline and signal computation
-- **pytest** — 39-test suite covering signal logic, exit rules, execution preview, risk guardrails
+- **pytest** — regression coverage for signal logic, exit rules, execution preview, risk guardrails, broker sync, and monitoring controls
 
 ---
 
@@ -67,8 +73,11 @@ Core runtime components:
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/YOUR_USERNAME/options-trading-ai.git
-cd options-trading-ai/projects/options_trading_ai
+git clone https://github.com/SmartNSavyBuilds/Options-Trading-AI.git
+cd Options-Trading-AI
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1  # Windows PowerShell
+# source .venv/bin/activate    # macOS/Linux
 pip install -r requirements.txt
 
 # 2. Configure broker credentials
@@ -84,6 +93,34 @@ python market_monitor.py --loop --interval-seconds 900
 # 5. Launch the dashboard
 streamlit run dashboard.py
 ```
+
+---
+
+## Deterministic Operator Workflow
+
+Use this single command for a deterministic operator run sequence:
+
+```bash
+python run_deterministic_pipeline.py
+```
+
+The run order is fixed and deterministic:
+
+1. sync broker
+2. build queue
+3. execute entries
+4. execute exits
+5. run controls
+6. generate gate report
+
+Operational notes:
+- The run writes a machine-readable summary file to `outputs/deterministic_pipeline_last_run.json`.
+- By default, broker connectivity is required (`connection_status=connected`).
+- Add `--allow-disconnected` only for controlled diagnostics.
+- Add `--strict-gate` to fail the command when `pre_live_gate_check.py` returns a fail verdict.
+
+Recovery integration:
+- `reconcile_after_broker_auth.py` now uses this same deterministic pipeline after auth is restored, so normal operations and post-incident recovery share one execution path.
 
 ---
 
@@ -123,22 +160,23 @@ Before any trade enters the paper queue:
 ## Testing
 
 ```bash
-cd projects/options_trading_ai
-python -m pytest tests/ -v
-# 39 tests covering: signal engine, exit rules, execution preview,
-# risk guardrails, congressional data, performance journal
+python -m pytest tests/ -q
 ```
+
+The suite covers signal logic, exit rules, execution preview, risk guardrails, congressional data, performance journal, worker health, and pre-live control checks.
 
 ---
 
 ## Paper Trading Status
-This system is running in **active paper-trading operations mode** with live broker sync and automated control oversight.
+This project supports paper-first broker sync, risk controls, queue review, and paper execution. That capability does not mean the unattended monitor is currently healthy or running.
 
-Current operating posture:
-- daily control audits are running and writing audit snapshots to the output layer
-- concentration and control misses can automatically block new queue submissions
-- monitor and performance staleness are tracked explicitly before execution decisions
-- execution and queue state are visible through the dashboard and audit feeds
+### Verification Snapshot — 2026-10-01
+
+- A read-only check against the configured Alpaca paper endpoint succeeded; no orders were submitted during the check.
+- A broker-order reconciliation failure caused by an empty timestamp column being inferred as numeric was fixed in `src/execution.py`.
+- The regression test for that failure and all 54 tests in `tests/test_trading_enhancements.py` pass.
+- A complete monitor cycle has not yet been verified after the fix; the most recent prior monitor records showed failed cycles.
+- Before resuming unattended paper automation, run a supervised cycle with submissions disabled and verify fresh broker, worker, and control outputs. Check local scheduling and `.env` settings before enabling automatic submissions.
 
 Live deployment remains gated. Promotion beyond paper mode still requires a larger forward track record with stable expectancy, controlled drawdowns, and verified execution quality across multiple market regimes.
 
@@ -208,8 +246,6 @@ To begin, the system needs to do three things well:
 - automatic queue hold logic that blocks new entries when concentration or control checks fail
 - control audit snapshots written to CSV on every run with a running history log
 - Windows Task Scheduler integration for fully automated daily audit execution
-- Claude AI advisory layer integrated for trade commentary, thesis summaries, and operator guidance on candidate setups
-- ecommerce automation engine built with Shopify and TikTok API integration, automating product catalog sync, trend matching, keyword indexing, and performance reporting across 1,000+ SKUs
 - portfolio daily checks CSV added for tracking equity, exposure, and control state over time
 - alerts feed expanded to capture concentration breaches and stale monitor events automatically
 - paper trade queue enhanced with guardrail status, sector exposure tracking, correlation bucket tracking, and approval state columns
@@ -246,8 +282,6 @@ Previous additions included in the project:
 - daily control audit script created with automated staleness detection and concentration breach checking
 - queue auto-hold logic added so new entries are blocked when risk controls are breached
 - Windows scheduled task created for daily automated control check execution
-- Claude AI advisory integration added for trade commentary and operator guidance
-- ecommerce engine built with Shopify and TikTok APIs for catalog sync and trend matching
 - portfolio daily checks CSV and control audit history CSV added to output layer
 - alerts feed expanded to capture control misses and concentration breaches automatically
 - paper trade queue enhanced with sector exposure, correlation bucket, and guardrail status tracking

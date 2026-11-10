@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +20,25 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 PAPER_BASE_URL = 'https://paper-api.alpaca.markets'
 LIVE_BASE_URL = 'https://api.alpaca.markets'
+BROKER_AUTH_DIAGNOSTIC_FILE = OUTPUT_DIR / 'broker_auth_diagnostic.json'
+
+_TRANSIENT_NETWORK_MARKERS = (
+    'temporary failure in name resolution',
+    'name resolution',
+    'nodename nor servname provided',
+    'failed to establish a new connection',
+    'connection reset',
+    'timed out',
+    'dns',
+)
+
+_ACTIVE_SUBMISSION_STATUSES = {
+    'new',
+    'accepted',
+    'partially_filled',
+    'submitted',
+    'pending_new',
+}
 
 
 def _load_env_file() -> None:
@@ -30,6 +52,144 @@ def _load_env_file() -> None:
             continue
         key, value = line.split('=', 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _save_broker_auth_diagnostic(detail: dict[str, Any]) -> None:
+    try:
+        BROKER_AUTH_DIAGNOSTIC_FILE.write_text(json.dumps(detail, indent=2, sort_keys=True), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _describe_broker_auth_failure(config: 'TradingConfig', endpoint: str, exc: Exception) -> str:
+    status_code = getattr(getattr(exc, 'response', None), 'status_code', None)
+    lowered = str(exc).lower()
+    is_auth_failure = status_code == 401 or 'unauthorized' in lowered or 'invalid api key' in lowered or 'authentication failed' in lowered
+    if not is_auth_failure:
+        return str(exc)
+
+    diagnosis = {
+        'checked_at_utc': datetime.now(timezone.utc).isoformat(),
+        'broker': config.broker,
+        'mode': config.trading_mode,
+        'base_url': config.base_url,
+        'endpoint': endpoint,
+        'status_code': status_code,
+        'api_key_present': bool(config.api_key),
+        'secret_key_present': bool(config.secret_key),
+        'detail': str(exc),
+        'likely_causes': [
+            'ALPACA_API_KEY or ALPACA_SECRET_KEY is missing, revoked, or mismatched',
+            'paper and live credentials are mixed with the wrong base URL',
+            'the Alpaca account does not have permission for the requested endpoint',
+        ],
+    }
+    _save_broker_auth_diagnostic(diagnosis)
+    return (
+        f'Alpaca auth failed with HTTP {status_code or 401} at {endpoint}. '
+        'Check that ALPACA_API_KEY and ALPACA_SECRET_KEY match the selected paper/live base URL, '
+        'and verify the credentials have not been revoked.'
+    )
+
+
+def _request_max_attempts() -> int:
+    raw = str(os.getenv('ALPACA_REQUEST_MAX_ATTEMPTS', '3') or '3').strip()
+    try:
+        return max(1, min(int(raw), 6))
+    except ValueError:
+        return 3
+
+
+def _is_transient_network_error(exc: Exception) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    lowered = str(exc).lower()
+    return any(marker in lowered for marker in _TRANSIENT_NETWORK_MARKERS)
+
+
+def _request_with_retries(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    timeout: int,
+    json_body: dict[str, Any] | None = None,
+) -> requests.Response:
+    attempts = _request_max_attempts()
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.request(method=method, url=url, headers=headers, json=json_body, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except requests.HTTPError as exc:
+            status_code = getattr(getattr(exc, 'response', None), 'status_code', None)
+            retryable_http = status_code in {429, 500, 502, 503, 504}
+            if retryable_http and attempt < attempts:
+                time.sleep(min(6.0, 0.75 * attempt))
+                last_exc = exc
+                continue
+            raise
+        except Exception as exc:
+            if attempt < attempts and _is_transient_network_error(exc):
+                time.sleep(min(6.0, 0.75 * attempt))
+                last_exc = exc
+                continue
+            raise
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError('Request retries exhausted unexpectedly')
+
+
+def _submission_cooldown_minutes() -> int:
+    raw = str(os.getenv('SUBMISSION_COOLDOWN_MINUTES', '120') or '120').strip()
+    try:
+        return max(0, min(int(raw), 1440))
+    except ValueError:
+        return 120
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_recent_submission(last_submitted_at: Any) -> bool:
+    submitted_at = _parse_utc_timestamp(last_submitted_at)
+    if submitted_at is None:
+        return False
+    elapsed_minutes = (datetime.now(timezone.utc) - submitted_at).total_seconds() / 60
+    return elapsed_minutes <= _submission_cooldown_minutes()
+
+
+def _is_already_submitted(existing_status: Any, last_submitted_at: Any) -> bool:
+    status = str(existing_status or '').strip().lower()
+    if status in _ACTIVE_SUBMISSION_STATUSES:
+        return True
+    # Treat old filled statuses as historical so they do not block fresh routing.
+    if status == 'filled':
+        return _is_recent_submission(last_submitted_at)
+    return False
+
+
+def _classify_connection_status(detail: str) -> str:
+    lowered_detail = str(detail or '').lower()
+    if 'unauthorized' in lowered_detail or 'auth failed' in lowered_detail:
+        return 'unauthorized'
+    if any(marker in lowered_detail for marker in _TRANSIENT_NETWORK_MARKERS):
+        return 'network_error'
+    return 'error'
 
 
 @dataclass(slots=True)
@@ -116,9 +276,60 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 
+def _is_hard_safety_hold(row: pd.Series) -> bool:
+    approval_status = str(row.get('approval_status', 'pending') or 'pending').strip().lower()
+    if approval_status in {'rejected', 'hold'}:
+        return True
+
+    guardrail_status = str(row.get('guardrail_status', '') or '').strip().lower()
+    if guardrail_status and guardrail_status not in {'pass', 'passed', 'clear', 'ok', 'approved'}:
+        return True
+
+    return False
+
+
+def _should_auto_approve_paper_row(row: pd.Series, config: TradingConfig) -> bool:
+    if config.trading_mode != 'paper':
+        return False
+
+    if not _bool_env('AUTO_APPROVE_PAPER_TRADES', False):
+        return False
+
+    if not config.auto_submit and config.approval_mode != 'automatic':
+        return False
+
+    if _is_hard_safety_hold(row):
+        return False
+
+    strict_mode = _bool_env('DISCOVERY_QUALITY_STRICT', True)
+    dq_status = str(row.get('discovery_quality_status', '') or '').strip().lower()
+    dq_override = _as_bool(row.get('discovery_quality_override', False))
+    if dq_status == 'block' and not dq_override and strict_mode:
+        return False
+
+    return True
+
+
 def _resolve_submit_approval(row: pd.Series, config: TradingConfig) -> tuple[str, bool]:
     approval_status = str(row.get('approval_status', 'pending') or 'pending').strip().lower()
     approved_for_submit = approval_status in {'approved', 'auto_approved'} or _as_bool(row.get('approved_for_submit', False))
+
+    strict_mode = _bool_env('DISCOVERY_QUALITY_STRICT', True)
+    dq_status = str(row.get('discovery_quality_status', '') or '').strip().lower()
+    dq_override = _as_bool(row.get('discovery_quality_override', False))
+    dq_blocked = dq_status == 'block' and not dq_override
+
+    if _is_hard_safety_hold(row):
+        return 'hold', False
+
+    if dq_blocked and strict_mode:
+        return 'hold', False
+
+    if _should_auto_approve_paper_row(row, config):
+        approved_for_submit = True
+        if approval_status not in {'approved', 'auto_approved'}:
+            approval_status = 'auto_approved'
+        return approval_status, approved_for_submit
 
     if config.approval_mode == 'automatic' and approval_status not in {'rejected', 'hold'}:
         approved_for_submit = True
@@ -143,11 +354,24 @@ def _infer_option_type_and_strike(options_setup: str, bias: str) -> tuple[str, f
         option_type = 'call'
 
     strike = 0.0
-    import re
     match = re.search(r'(\d+(?:\.\d+)?)\s*[CP]', text.upper())
     if match:
         strike = float(match.group(1))
     return option_type, strike
+
+
+def _looks_like_occ_option_symbol(symbol: str) -> bool:
+    text = str(symbol or '').strip().upper()
+    # OCC format example: INTC260626C00109000
+    return bool(re.fullmatch(r'[A-Z]{1,6}\d{6}[CP]\d{8}', text))
+
+
+def _option_position_intent(side: str, execution_style: str) -> str:
+    normalized_side = str(side or '').strip().lower()
+    style = str(execution_style or '').strip().lower()
+    if 'protective_exit' in style:
+        return 'sell_to_close' if normalized_side == 'sell' else 'buy_to_close'
+    return 'buy_to_open' if normalized_side == 'buy' else 'sell_to_open'
 
 
 def fetch_option_contracts(
@@ -156,7 +380,15 @@ def fetch_option_contracts(
     min_days: int | None = None,
     max_days: int | None = None,
     limit: int = 200,
+    target_strike: float | None = None,
+    strike_window_pct: float = 0.25,
 ) -> pd.DataFrame:
+    """Fetch active option contracts for an underlying within the given DTE window.
+
+    When `target_strike` is supplied the API request is narrowed to a
+    ±strike_window_pct band around that strike, preventing the 200-contract
+    limit from cutting off at-the-money contracts for high-priced underlyings.
+    """
     if config.broker != 'alpaca' or not config.api_key or not config.secret_key:
         return pd.DataFrame()
 
@@ -169,19 +401,34 @@ def fetch_option_contracts(
     expiry_gte = (today + pd.Timedelta(days=min_days)).strftime('%Y-%m-%d')
     expiry_lte = (today + pd.Timedelta(days=max_days)).strftime('%Y-%m-%d')
 
-    response = requests.get(
-        f"{config.base_url}/v2/options/contracts",
-        headers=_broker_headers(config),
-        params={
-            'underlying_symbols': underlying_symbol,
-            'status': 'active',
-            'expiration_date_gte': expiry_gte,
-            'expiration_date_lte': expiry_lte,
-            'limit': limit,
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
+    params: dict = {
+        'underlying_symbols': underlying_symbol,
+        'status': 'active',
+        'expiration_date_gte': expiry_gte,
+        'expiration_date_lte': expiry_lte,
+        'limit': limit,
+    }
+    if target_strike and target_strike > 0:
+        window = max(5.0, target_strike * strike_window_pct)
+        params['strike_price_gte'] = round(target_strike - window, 2)
+        params['strike_price_lte'] = round(target_strike + window, 2)
+
+    try:
+        response = requests.get(
+            f"{config.base_url}/v2/options/contracts",
+            headers=_broker_headers(config),
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = _describe_broker_auth_failure(config, '/v2/options/contracts', exc)
+        print(f'Option contract lookup skipped for {underlying_symbol}: {detail}')
+        return pd.DataFrame()
+    except requests.RequestException as exc:
+        print(f'Option contract lookup failed for {underlying_symbol}: {exc}')
+        return pd.DataFrame()
+
     body = response.json()
     contracts = pd.DataFrame(body.get('option_contracts', []))
     if contracts.empty:
@@ -255,6 +502,16 @@ def choose_best_option_contract(
     return working.iloc[0].to_dict()
 
 
+def _strike_mismatch_too_large(target_strike: float, chosen_strike: float) -> bool:
+    target = float(target_strike or 0.0)
+    chosen = float(chosen_strike or 0.0)
+    if target <= 0 or chosen <= 0:
+        return False
+
+    allowed_distance = max(5.0, target * 0.10)
+    return abs(chosen - target) > allowed_distance
+
+
 def _resolve_target_days_from_row(row: pd.Series, default_days: int) -> int:
     expiration_target = str(row.get('expiration_target', '') or '').strip()
     if expiration_target and expiration_target.lower() != 'unavailable':
@@ -307,7 +564,7 @@ def prepare_option_execution_preview(
             break
         approval_status, approved_for_submit = _resolve_submit_approval(row, config)
         existing_status = str(row.get('option_order_status', 'queued_for_review')).strip().lower()
-        already_submitted = existing_status in {'new', 'accepted', 'filled', 'partially_filled', 'submitted', 'pending_new'}
+        already_submitted = _is_already_submitted(existing_status, row.get('last_option_submitted_at', ''))
         underlying = str(row.get('ticker', '')).upper()
         option_type, target_strike = _infer_option_type_and_strike(str(row.get('options_setup', '')), str(row.get('bias', 'neutral')))
         target_days = _resolve_target_days_from_row(row, default_days=(config.target_option_dte_min + config.target_option_dte_max) // 2)
@@ -317,6 +574,7 @@ def prepare_option_execution_preview(
             underlying,
             min_days=min_days,
             max_days=max_days,
+            target_strike=target_strike,
         )
         chosen = choose_best_option_contract(
             contracts,
@@ -332,10 +590,20 @@ def prepare_option_execution_preview(
         if not chosen:
             continue
 
+        chosen_strike = float(chosen.get('strike_price', 0.0) or 0.0)
+        if _strike_mismatch_too_large(target_strike, chosen_strike):
+            continue
+
         close_price = float(chosen.get('close_price', 0.0) or 0.0)
         estimated_contract_cost = max(close_price * 100, 1.0)
         target_notional = config.account_size_usd * (float(row.get('allocation_pct', 1.0) or 1.0) / 100.0)
-        qty = max(1, min(2, math.floor(target_notional / estimated_contract_cost))) if estimated_contract_cost > 0 else 1
+        max_risk_usd = float(row.get('max_risk_usd', 0.0) or 0.0)
+        risk_budget = target_notional
+        if max_risk_usd > 0:
+            risk_budget = min(risk_budget, max_risk_usd)
+        qty = min(2, math.floor(risk_budget / estimated_contract_cost)) if estimated_contract_cost > 0 else 0
+        if qty <= 0:
+            continue
         client_order_id = f"{config.trading_mode}-option-{underlying}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
         preview_rows.append({
@@ -347,12 +615,12 @@ def prepare_option_execution_preview(
             'proxy_qty': int(qty),
             'signal_score': int(row.get('signal_score', 0)),
             'projected_return_pct': float(row.get('projected_return_pct', 0.0)),
-            'max_risk_usd': float(row.get('max_risk_usd', 0.0)),
+            'max_risk_usd': max_risk_usd,
             'options_setup': row.get('options_setup', 'No trade'),
             'contract_name': chosen.get('name', ''),
             'expiration_date': str(chosen.get('expiration_date', ''))[:10],
             'days_to_expiration': int(chosen.get('days_to_expiration', 0) or 0),
-            'strike_price': float(chosen.get('strike_price', 0.0) or 0.0),
+            'strike_price': chosen_strike,
             'option_type': option_type,
             'estimated_contract_cost_usd': round(estimated_contract_cost, 2),
             'approval_status': approval_status,
@@ -399,7 +667,7 @@ def prepare_equity_execution_preview(
         qty = max(1, math.floor(target_notional / last_close)) if last_close > 0 else 0
         approval_status, approved_for_submit = _resolve_submit_approval(row, config)
         existing_status = str(row.get('order_status', 'queued_for_review')).strip().lower()
-        already_submitted = existing_status in {'new', 'accepted', 'filled', 'partially_filled', 'submitted', 'pending_new'}
+        already_submitted = _is_already_submitted(existing_status, row.get('last_submitted_at', ''))
         client_order_id = f"{config.trading_mode}-{row['ticker']}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
         preview_rows.append(
@@ -514,7 +782,7 @@ def prepare_exit_execution_preview(
         exit_side = 'sell' if side == 'long' else 'buy'
         approved = _as_bool(row.get('exit_approved', False))
         existing_status = str(row.get('order_status', 'monitor')).strip().lower()
-        already_submitted = existing_status in {'new', 'accepted', 'filled', 'partially_filled', 'submitted', 'pending_new'}
+        already_submitted = _is_already_submitted(existing_status, row.get('last_submitted_at', ''))
         client_order_id = f"{config.trading_mode}-exit-{symbol}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
         preview_rows.append({
@@ -619,13 +887,16 @@ def _broker_headers(config: TradingConfig) -> dict[str, str]:
 
 
 def _fetch_alpaca_json(config: TradingConfig, endpoint: str) -> Any:
-    response = requests.get(
-        f"{config.base_url}{endpoint}",
-        headers=_broker_headers(config),
-        timeout=20,
-    )
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = _request_with_retries(
+            method='GET',
+            url=f"{config.base_url}{endpoint}",
+            headers=_broker_headers(config),
+            timeout=20,
+        )
+        return response.json()
+    except requests.HTTPError as exc:
+        raise requests.HTTPError(_describe_broker_auth_failure(config, endpoint, exc)) from exc
 
 
 def sync_broker_state(config: TradingConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -700,11 +971,13 @@ def sync_broker_state(config: TradingConfig) -> tuple[pd.DataFrame, pd.DataFrame
             'detail': str(account_body.get('status', 'active')),
         }], columns=account_columns)
     except Exception as exc:
+        detail = _describe_broker_auth_failure(config, '/v2/account', exc)
+        connection_status = _classify_connection_status(detail)
         account = pd.DataFrame([{
             'synced_at_utc': timestamp,
             'broker': config.broker,
             'mode': config.trading_mode,
-            'connection_status': 'error',
+            'connection_status': connection_status,
             'market_status': 'unknown',
             'equity': 0.0,
             'cash': 0.0,
@@ -713,7 +986,7 @@ def sync_broker_state(config: TradingConfig) -> tuple[pd.DataFrame, pd.DataFrame
             'options_approved_level': 0,
             'options_trading_level': 0,
             'options_buying_power': 0.0,
-            'detail': str(exc),
+            'detail': detail,
         }], columns=account_columns)
 
     try:
@@ -847,6 +1120,8 @@ def update_exit_recommendations_from_broker_orders(orders: pd.DataFrame) -> None
         recommendations['order_status'] = 'monitor'
     if 'last_submitted_at' not in recommendations.columns:
         recommendations['last_submitted_at'] = ''
+    recommendations['order_status'] = recommendations['order_status'].astype(object)
+    recommendations['last_submitted_at'] = recommendations['last_submitted_at'].astype(object)
 
     exit_orders = orders.copy()
     if 'client_order_id' in exit_orders.columns:
@@ -941,21 +1216,25 @@ def submit_single_order(order: pd.Series, config: TradingConfig) -> dict[str, An
         })
 
     try:
+        symbol = str(order['ticker']).upper()
+        side = str(order['proxy_side']).strip().lower()
         payload = {
-            'symbol': order['ticker'],
+            'symbol': symbol,
             'qty': int(order['proxy_qty']),
-            'side': order['proxy_side'],
+            'side': side,
             'type': 'market',
             'time_in_force': 'day',
             'client_order_id': order['client_order_id'],
         }
-        response = requests.post(
-            f"{config.base_url}/v2/orders",
+        if _looks_like_occ_option_symbol(symbol):
+            payload['position_intent'] = _option_position_intent(side, str(order.get('execution_style', '')))
+        response = _request_with_retries(
+            method='POST',
+            url=f"{config.base_url}/v2/orders",
             headers=_broker_headers(config),
-            json=payload,
+            json_body=payload,
             timeout=20,
         )
-        response.raise_for_status()
         body = response.json()
         result = {
             **base_result,
@@ -967,10 +1246,20 @@ def submit_single_order(order: pd.Series, config: TradingConfig) -> dict[str, An
             notify_discord(config.discord_webhook_url, title, fields, color, status)
         return result
     except Exception as exc:
+        response_text = ''
+        response_obj = getattr(exc, 'response', None)
+        if response_obj is not None:
+            try:
+                response_text = str(response_obj.text or '').strip()
+            except Exception:
+                response_text = ''
+        detail = str(exc)
+        if response_text:
+            detail = f"{detail} | response={response_text}"
         result = {
             **base_result,
             'status': 'error',
-            'detail': str(exc),
+            'detail': detail,
         }
         if config.discord_webhook_url:
             title, fields, color, status = _build_order_notification(order, result)
@@ -1012,7 +1301,14 @@ def notify_discord(
 
     try:
         response = requests.post(webhook_url, json=payload, timeout=5)
-        return response.status_code in {200, 204}
+        if response.status_code in {200, 204}:
+            return True
+        print(
+            'Discord notification failed '
+            f'(status={response.status_code}): '
+            f"{response.text[:300]}"
+        )
+        return False
     except Exception as exc:
         print(f'Discord notification failed: {exc}')
         return False

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import requests
 
+import market_monitor as monitor
 from paper_trade import build_paper_trade_queue
 from src.congressional_disclosures import import_raw_trade_data, build_public_interest_watchlist, build_recent_large_trades
 from src.execution import (
@@ -45,7 +49,9 @@ def test_bearish_breakdown_gets_ranked_for_shorts() -> None:
     assert row['suggested_structure'] in {'Bear put spread', 'Long put'}
 
 
-def test_prepare_exit_execution_preview_requires_guardrails() -> None:
+def test_prepare_exit_execution_preview_requires_guardrails(monkeypatch) -> None:
+    monkeypatch.setenv('ENABLE_EXIT_AUTOMATION', 'false')
+
     recommendations = pd.DataFrame(
         [
             {
@@ -136,11 +142,16 @@ def test_build_public_interest_watchlist_surfaces_pelosi() -> None:
 
 
 def test_choose_best_option_contract_prefers_short_dated_tradable_match() -> None:
+    today = datetime.now(timezone.utc).date()
+    near_expiry = (today + timedelta(days=7)).isoformat()
+    mid_expiry = (today + timedelta(days=14)).isoformat()
+    far_expiry = (today + timedelta(days=35)).isoformat()
+
     contracts = pd.DataFrame(
         [
-            {'symbol': 'AMD260417C00270000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': '2026-04-17', 'strike_price': '270'},
-            {'symbol': 'AMD260424C00280000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': '2026-04-24', 'strike_price': '280'},
-            {'symbol': 'AMD260515C00290000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': '2026-05-15', 'strike_price': '290'},
+            {'symbol': 'AMD260417C00270000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': near_expiry, 'strike_price': '270'},
+            {'symbol': 'AMD260424C00280000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': mid_expiry, 'strike_price': '280'},
+            {'symbol': 'AMD260515C00290000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': far_expiry, 'strike_price': '290'},
         ]
     )
 
@@ -151,6 +162,9 @@ def test_choose_best_option_contract_prefers_short_dated_tradable_match() -> Non
 
 
 def test_prepare_option_execution_preview_uses_contract_symbol() -> None:
+    today = datetime.now(timezone.utc).date()
+    near_expiry = (today + timedelta(days=7)).isoformat()
+
     queue = pd.DataFrame(
         [
             {
@@ -170,12 +184,20 @@ def test_prepare_option_execution_preview_uses_contract_symbol() -> None:
     contracts = {
         'AMD': pd.DataFrame(
             [
-                {'symbol': 'AMD260424C00280000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': '2026-04-24', 'strike_price': '280'}
+                {'symbol': 'AMD260424C00280000', 'underlying_symbol': 'AMD', 'type': 'call', 'tradable': True, 'expiration_date': near_expiry, 'strike_price': '280'}
             ]
         )
     }
 
-    config = TradingConfig(auto_submit=True, trading_mode='paper', use_proxy_equities=False)
+    config = TradingConfig(
+        auto_submit=True,
+        trading_mode='paper',
+        use_proxy_equities=False,
+        min_option_dte=1,
+        max_option_dte=10,
+        target_option_dte_min=1,
+        target_option_dte_max=10,
+    )
     preview = prepare_option_execution_preview(queue, config, contracts_map=contracts, max_days=10)
 
     assert not preview.empty
@@ -183,6 +205,107 @@ def test_prepare_option_execution_preview_uses_contract_symbol() -> None:
     assert row['ticker'] == 'AMD260424C00280000'
     assert row['execution_style'] == 'single_leg_option_paper'
     assert bool(row['ready_for_broker_submit']) is True
+
+
+def test_prepare_option_execution_preview_skips_large_strike_mismatch() -> None:
+    today = datetime.now(timezone.utc).date()
+    target_expiry = (today + timedelta(days=16)).isoformat()
+
+    queue = pd.DataFrame(
+        [
+            {
+                'ticker': 'META',
+                'bias': 'bullish',
+                'options_setup': 'Buy 624C / Sell 643C',
+                'signal_score': 5,
+                'projected_return_pct': 97.44,
+                'max_risk_usd': 883.12,
+                'allocation_pct': 1.2,
+                'approval_status': 'approved',
+                'approved_for_submit': True,
+                'order_status': 'queued_for_review',
+            }
+        ]
+    )
+    contracts = {
+        'META': pd.DataFrame(
+            [
+                {
+                    'symbol': 'META260710C00390000',
+                    'underlying_symbol': 'META',
+                    'type': 'call',
+                    'tradable': True,
+                    'expiration_date': target_expiry,
+                    'strike_price': '390',
+                    'close_price': '233.55',
+                }
+            ]
+        )
+    }
+
+    config = TradingConfig(
+        auto_submit=True,
+        trading_mode='paper',
+        use_proxy_equities=False,
+        min_option_dte=1,
+        max_option_dte=30,
+        target_option_dte_min=1,
+        target_option_dte_max=30,
+    )
+    preview = prepare_option_execution_preview(queue, config, contracts_map=contracts, max_days=30)
+
+    assert preview.empty
+
+
+def test_prepare_option_execution_preview_skips_contracts_over_risk_budget() -> None:
+    today = datetime.now(timezone.utc).date()
+    target_expiry = (today + timedelta(days=16)).isoformat()
+
+    queue = pd.DataFrame(
+        [
+            {
+                'ticker': 'AAPL',
+                'bias': 'bullish',
+                'options_setup': 'Buy 220C',
+                'signal_score': 9,
+                'projected_return_pct': 32.0,
+                'max_risk_usd': 250.0,
+                'allocation_pct': 3.0,
+                'approval_status': 'approved',
+                'approved_for_submit': True,
+                'order_status': 'queued_for_review',
+            }
+        ]
+    )
+    contracts = {
+        'AAPL': pd.DataFrame(
+            [
+                {
+                    'symbol': 'AAPL260717C00220000',
+                    'underlying_symbol': 'AAPL',
+                    'type': 'call',
+                    'tradable': True,
+                    'expiration_date': target_expiry,
+                    'strike_price': '220',
+                    'close_price': '4.00',
+                }
+            ]
+        )
+    }
+
+    config = TradingConfig(
+        auto_submit=True,
+        trading_mode='paper',
+        use_proxy_equities=False,
+        account_size_usd=100000.0,
+        min_option_dte=1,
+        max_option_dte=30,
+        target_option_dte_min=1,
+        target_option_dte_max=30,
+    )
+    preview = prepare_option_execution_preview(queue, config, contracts_map=contracts, max_days=30)
+
+    assert preview.empty
 
 
 def test_prepare_equity_execution_preview_auto_approves_in_automatic_mode() -> None:
@@ -206,6 +329,67 @@ def test_prepare_equity_execution_preview_auto_approves_in_automatic_mode() -> N
 
     config = TradingConfig(auto_submit=True, trading_mode='paper', approval_mode='automatic')
     preview = prepare_equity_execution_preview(queue, signals, config)
+
+    assert not preview.empty
+    row = preview.iloc[0]
+    assert row['approval_status'] == 'auto_approved'
+    assert bool(row['approved_for_submit']) is True
+    assert bool(row['ready_for_broker_submit']) is True
+
+
+def test_prepare_option_execution_preview_auto_approves_paper_rows_when_safe(monkeypatch) -> None:
+    monkeypatch.setenv('AUTO_APPROVE_PAPER_TRADES', 'true')
+    monkeypatch.setenv('DISCOVERY_QUALITY_STRICT', 'false')
+
+    today = datetime.now(timezone.utc).date()
+    target_expiry = (today + timedelta(days=16)).isoformat()
+
+    queue = pd.DataFrame(
+        [
+            {
+                'ticker': 'AAPL',
+                'bias': 'bullish',
+                'options_setup': 'Buy 220C',
+                'signal_score': 9,
+                'projected_return_pct': 32.0,
+                'max_risk_usd': 1000.0,
+                'allocation_pct': 10.0,
+                'approval_status': 'pending',
+                'approved_for_submit': False,
+                'order_status': 'queued_for_review',
+                'guardrail_status': 'pass',
+                'discovery_quality_status': 'block',
+                'discovery_quality_override': False,
+            }
+        ]
+    )
+    contracts = {
+        'AAPL': pd.DataFrame(
+            [
+                {
+                    'symbol': 'AAPL260717C00220000',
+                    'underlying_symbol': 'AAPL',
+                    'type': 'call',
+                    'tradable': True,
+                    'expiration_date': target_expiry,
+                    'strike_price': '220',
+                    'close_price': '4.00',
+                }
+            ]
+        )
+    }
+
+    config = TradingConfig(
+        auto_submit=True,
+        trading_mode='paper',
+        use_proxy_equities=False,
+        account_size_usd=100000.0,
+        min_option_dte=1,
+        max_option_dte=30,
+        target_option_dte_min=1,
+        target_option_dte_max=30,
+    )
+    preview = prepare_option_execution_preview(queue, config, contracts_map=contracts, max_days=30)
 
     assert not preview.empty
     row = preview.iloc[0]
@@ -258,6 +442,73 @@ def test_build_exit_recommendations_includes_option_close_plan() -> None:
     assert 'close' in str(row['close_or_exercise_plan']).lower() or 'exercise' in str(row['close_or_exercise_plan']).lower()
 
 
+def test_sync_broker_state_classifies_401_as_unauthorized(tmp_path: Path, monkeypatch) -> None:
+    from src import execution
+
+    outputs = tmp_path / 'outputs'
+    outputs.mkdir()
+    monkeypatch.setattr(execution, 'OUTPUT_DIR', outputs)
+    monkeypatch.setattr(execution, 'BROKER_AUTH_DIAGNOSTIC_FILE', outputs / 'broker_auth_diagnostic.json')
+
+    config = TradingConfig(api_key='key', secret_key='secret', base_url='https://paper-api.alpaca.markets')
+
+    class FakeResponse:
+        status_code = 401
+
+        def raise_for_status(self) -> None:
+            raise requests.HTTPError('401 Client Error: Unauthorized for url: https://paper-api.alpaca.markets/v2/account', response=self)
+
+        def json(self) -> dict[str, str]:
+            return {}
+
+    def fake_get(url, headers=None, timeout=None):
+        return FakeResponse()
+
+    monkeypatch.setattr(execution.requests, 'get', fake_get)
+
+    account, positions = execution.sync_broker_state(config)
+
+    assert not account.empty
+    assert str(account.iloc[0]['connection_status']) == 'unauthorized'
+    assert 'Alpaca auth failed' in str(account.iloc[0]['detail'])
+    assert positions.empty
+
+
+def test_fetch_option_contracts_handles_401_without_raising(tmp_path: Path, monkeypatch) -> None:
+    from src import execution
+
+    outputs = tmp_path / 'outputs'
+    outputs.mkdir()
+    monkeypatch.setattr(execution, 'OUTPUT_DIR', outputs)
+    monkeypatch.setattr(execution, 'BROKER_AUTH_DIAGNOSTIC_FILE', outputs / 'broker_auth_diagnostic.json')
+
+    config = TradingConfig(api_key='key', secret_key='secret', base_url='https://paper-api.alpaca.markets')
+
+    class FakeResponse:
+        status_code = 401
+
+        def raise_for_status(self) -> None:
+            raise requests.HTTPError(
+                '401 Client Error: Unauthorized for url: https://paper-api.alpaca.markets/v2/options/contracts',
+                response=self,
+            )
+
+        def json(self) -> dict[str, str]:
+            return {}
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return FakeResponse()
+
+    monkeypatch.setattr(execution.requests, 'get', fake_get)
+
+    contracts = execution.fetch_option_contracts(config, 'AMD', min_days=14, max_days=45)
+
+    assert contracts.empty
+    assert execution.BROKER_AUTH_DIAGNOSTIC_FILE.exists()
+    detail = execution.BROKER_AUTH_DIAGNOSTIC_FILE.read_text(encoding='utf-8')
+    assert '/v2/options/contracts' in detail
+
+
 def test_build_performance_journal_creates_open_position_rows() -> None:
     positions = pd.DataFrame(
         [
@@ -303,6 +554,23 @@ def test_add_execution_status_to_candidates_marks_open_names() -> None:
     assert snap_state == 'Open / Executed'
     assert meta_state == 'Research Queue'
     assert bool(marked.loc[marked['ticker'] == 'SNAP', 'is_open_executed'].iloc[0]) is True
+
+
+def test_queue_needs_recovery_flags_stale_hold_rows(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(monitor, 'OUTPUT_DIR', tmp_path)
+    monkeypatch.setenv('PAPER_QUEUE_RECOVERY_MINUTES', '60')
+
+    stale_ts = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    queue_path = tmp_path / 'paper_trade_queue.csv'
+    pd.DataFrame([
+        {
+            'ticker': 'SNAP',
+            'approval_status': 'hold',
+            'queue_refreshed_at_utc': stale_ts,
+        }
+    ]).to_csv(queue_path, index=False)
+
+    assert monitor._queue_needs_recovery(queue_path) is True
 
 
 def test_build_priority_alerts_flags_urgent_positions() -> None:
@@ -717,3 +985,182 @@ def test_exit_rules_reduce_on_signal_flip_to_neutral() -> None:
     signals = pd.DataFrame([{'ticker': 'AMD', 'signal_score': 0, 'bias': 'neutral'}])
     recs = build_exit_recommendations(positions, signals)
     assert recs.iloc[0]['action'] in {'reduce_or_close', 'stop_out'}
+
+
+def test_build_paper_trade_queue_applies_discovery_quality_hold(tmp_path: Path, monkeypatch) -> None:
+    import paper_trade as pt
+
+    wiki_dir = tmp_path / 'wiki'
+    outputs_dir = tmp_path / 'outputs'
+    wiki_dir.mkdir()
+    outputs_dir.mkdir()
+
+    payload = {
+        'formula_version': 'v1',
+        'threshold': 60,
+        'items': [
+            {
+                'ticker': 'SNAP',
+                'discovery_quality_score': 42.0,
+                'status': 'block',
+                'formula_version': 'v1',
+                'meta': {'blocked_reasons': ['score below threshold 60']},
+            }
+        ],
+    }
+    (wiki_dir / 'discovery_quality.json').write_text(json.dumps(payload), encoding='utf-8')
+
+    monkeypatch.setattr(pt, 'WIKI_DIR', wiki_dir)
+    monkeypatch.setattr(pt, 'OUTPUT_DIR', outputs_dir)
+
+    candidates = pd.DataFrame(
+        [
+            {
+                'ticker': 'SNAP',
+                'options_setup': 'Buy 6C',
+                'signal_score': 8,
+                'projected_return_pct': 35.0,
+                'allocation_pct': 1.0,
+                'rank_score': 95.0,
+                'max_risk_usd': 300.0,
+                'bias': 'bullish',
+            }
+        ]
+    )
+
+    queue = pt.build_paper_trade_queue(candidates, existing_tickers=set(), max_positions=5)
+
+    assert not queue.empty
+    row = queue.iloc[0]
+    assert row['approval_status'] == 'hold'
+    assert bool(row['approved_for_submit']) is False
+    assert row['discovery_quality_status'] == 'block'
+    assert 'Discovery quality gate blocked routing' in str(row['comment'])
+
+
+def test_prepare_equity_execution_preview_holds_discovery_quality_blocks() -> None:
+    queue = pd.DataFrame(
+        [
+            {
+                'ticker': 'SNAP',
+                'bias': 'bullish',
+                'options_setup': 'Buy 6C',
+                'signal_score': 8,
+                'projected_return_pct': 42.0,
+                'max_risk_usd': 200.0,
+                'allocation_pct': 1.0,
+                'approval_status': 'pending',
+                'approved_for_submit': False,
+                'order_status': 'queued_for_review',
+                'discovery_quality_status': 'block',
+            }
+        ]
+    )
+    signals = pd.DataFrame([{'ticker': 'SNAP', 'last_close': 10.0}])
+
+    config = TradingConfig(auto_submit=True, trading_mode='paper', approval_mode='automatic')
+    preview = prepare_equity_execution_preview(queue, signals, config)
+
+    assert not preview.empty
+    row = preview.iloc[0]
+    assert row['approval_status'] == 'hold'
+    assert bool(row['approved_for_submit']) is False
+    assert bool(row['ready_for_broker_submit']) is False
+
+
+def test_prepare_equity_execution_preview_allows_discovery_quality_override() -> None:
+    queue = pd.DataFrame(
+        [
+            {
+                'ticker': 'SNAP',
+                'bias': 'bullish',
+                'options_setup': 'Buy 6C',
+                'signal_score': 8,
+                'projected_return_pct': 42.0,
+                'max_risk_usd': 200.0,
+                'allocation_pct': 1.0,
+                'approval_status': 'pending',
+                'approved_for_submit': False,
+                'order_status': 'queued_for_review',
+                'discovery_quality_status': 'block',
+                'discovery_quality_override': True,
+            }
+        ]
+    )
+    signals = pd.DataFrame([{'ticker': 'SNAP', 'last_close': 10.0}])
+
+    config = TradingConfig(auto_submit=True, trading_mode='paper', approval_mode='automatic')
+    preview = prepare_equity_execution_preview(queue, signals, config)
+
+    assert not preview.empty
+    row = preview.iloc[0]
+    assert row['approval_status'] == 'auto_approved'
+    assert bool(row['approved_for_submit']) is True
+    assert bool(row['ready_for_broker_submit']) is True
+
+
+def test_append_note_adds_once_and_collapses_repeats() -> None:
+    from paper_trade import _append_note
+
+    note = 'Discovery quality gate blocked routing: score below threshold 60.'
+    assert _append_note('Eligible.', note) == f'Eligible. {note}'
+    assert _append_note(f'Eligible. {note} {note} {note}', note) == f'Eligible. {note}'
+    assert _append_note('', note) == note
+
+
+def test_build_paper_trade_queue_empty_existing_set_ignores_live_positions(monkeypatch, tmp_path: Path) -> None:
+    import paper_trade as pt
+
+    outputs_dir = tmp_path / 'outputs'
+    outputs_dir.mkdir()
+    pd.DataFrame([{'symbol': 'XLF261123C00058000', 'side': 'long', 'qty': 1, 'market_value': 90.0}]).to_csv(
+        outputs_dir / 'broker_positions.csv', index=False
+    )
+    monkeypatch.setattr(pt, 'OUTPUT_DIR', outputs_dir)
+    candidates = pd.DataFrame(
+        [{'ticker': 'XLF', 'options_setup': 'Buy 55C', 'signal_score': 8, 'projected_return_pct': 28.0,
+          'allocation_pct': 1.0, 'rank_score': 98.0, 'max_risk_usd': 250.0, 'bias': 'bullish'}]
+    )
+
+    queue = pt.build_paper_trade_queue(candidates, existing_tickers=set(), max_positions=5)
+
+    assert list(queue['ticker']) == ['XLF']
+
+
+def test_execution_quality_counts_real_fills_from_broker_orders() -> None:
+    execution_log = pd.DataFrame(
+        [{'ticker': 'XLF', 'status': 'pending_new', 'execution_style': 'single_leg_option_paper'}]
+    )
+    broker_orders = pd.DataFrame(
+        [
+            {'client_order_id': 'paper-option-XLF-1', 'status': 'filled'},
+            {'client_order_id': 'paper-option-DIA-2', 'status': 'expired'},
+            {'client_order_id': 'paper-exit-XLF-3', 'status': 'filled'},
+        ]
+    )
+
+    quality = build_execution_quality_report(execution_log, broker_orders)
+    option_row = quality.loc[quality['execution_style'] == 'Single Leg Option Paper'].iloc[0]
+    exit_row = quality.loc[quality['execution_style'] == 'Protective Exit Paper'].iloc[0]
+
+    assert int(option_row['filled_orders']) == 1
+    assert float(option_row['fill_rate_pct']) == 50.0
+    assert float(exit_row['fill_rate_pct']) == 100.0
+
+
+def test_auth_gateway_rejects_login_when_credentials_not_configured(monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    try:
+        import auth_gateway
+    except TypeError as exc:
+        pytest.skip(f'installed fastapi/starlette versions are incompatible: {exc}')
+
+    monkeypatch.setattr(auth_gateway, 'GATEWAY_EMAIL', '')
+    monkeypatch.setattr(auth_gateway, 'GATEWAY_PASSWORD', '')
+
+    response = asyncio.run(auth_gateway.login_submit(email='', password='', response=None))
+
+    assert response.status_code == 401

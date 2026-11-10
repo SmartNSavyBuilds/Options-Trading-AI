@@ -96,6 +96,12 @@ def classify_symbol_profile(symbol: str) -> dict[str, str]:
     }
 
 
+def _numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column in frame.columns:
+        return pd.to_numeric(frame[column], errors='coerce').fillna(default)
+    return pd.Series(default, index=frame.index, dtype='float64')
+
+
 def build_exposure_summary(positions: pd.DataFrame, account_size_usd: float = 100_000.0) -> pd.DataFrame:
     if positions.empty:
         return pd.DataFrame(columns=EXPOSURE_SUMMARY_COLUMNS)
@@ -103,7 +109,7 @@ def build_exposure_summary(positions: pd.DataFrame, account_size_usd: float = 10
     working = positions.copy()
     working['symbol'] = working.get('symbol', pd.Series('', index=working.index)).astype(str).str.upper()
     working['underlying_symbol'] = working['symbol'].map(extract_underlying_symbol)
-    working['market_value'] = pd.to_numeric(working.get('market_value', 0.0), errors='coerce').fillna(0.0).abs()
+    working['market_value'] = _numeric_series(working, 'market_value', 0.0).abs()
     working['asset_class'] = working['symbol'].map(lambda value: 'option' if _is_option_symbol(value) else 'stock')
 
     summary = working.groupby('underlying_symbol', dropna=False).agg(
@@ -146,7 +152,7 @@ def build_risk_overview(positions: pd.DataFrame, account_size_usd: float = 100_0
 
     working = positions.copy()
     working['symbol'] = working.get('symbol', pd.Series('', index=working.index)).astype(str).str.upper()
-    working['market_value'] = pd.to_numeric(working.get('market_value', 0.0), errors='coerce').fillna(0.0).abs()
+    working['market_value'] = _numeric_series(working, 'market_value', 0.0).abs()
     working['asset_class'] = working['symbol'].map(lambda value: 'option' if _is_option_symbol(value) else 'stock')
     summary = build_exposure_summary(working, account_size_usd=account_size_usd)
 
@@ -200,7 +206,7 @@ def build_stress_test_table(positions: pd.DataFrame) -> pd.DataFrame:
 
     working = positions.copy()
     working['symbol'] = working.get('symbol', pd.Series('', index=working.index)).astype(str).str.upper()
-    working['market_value'] = pd.to_numeric(working.get('market_value', 0.0), errors='coerce').fillna(0.0).abs()
+    working['market_value'] = _numeric_series(working, 'market_value', 0.0).abs()
     working['asset_class'] = working['symbol'].map(lambda value: 'option' if _is_option_symbol(value) else 'stock')
     working['beta_multiplier'] = working['asset_class'].map({'stock': 1.0, 'option': 1.8}).fillna(1.0)
     working.loc[working['symbol'].map(extract_underlying_symbol).isin(CRYPTO_SYMBOLS), 'beta_multiplier'] = 1.6
@@ -238,7 +244,7 @@ def apply_exposure_guardrails(
     positions = positions.copy() if positions is not None else pd.DataFrame(columns=['symbol', 'market_value'])
     if not positions.empty:
         positions['symbol'] = positions.get('symbol', pd.Series('', index=positions.index)).astype(str).str.upper()
-        positions['market_value'] = pd.to_numeric(positions.get('market_value', 0.0), errors='coerce').fillna(0.0).abs()
+        positions['market_value'] = _numeric_series(positions, 'market_value', 0.0).abs()
         positions['asset_class'] = positions['symbol'].map(lambda value: 'option' if _is_option_symbol(value) else 'stock')
 
     exposure_summary = build_exposure_summary(positions, account_size_usd=account_size_usd)

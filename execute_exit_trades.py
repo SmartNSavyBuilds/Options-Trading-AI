@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from bootstrap_path import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
 from src.execution import (
     TradingConfig,
     append_execution_log,

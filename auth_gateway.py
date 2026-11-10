@@ -175,7 +175,8 @@ async def login_submit(
 ) -> Response:
     email_ok = _constant_time_compare(email.strip().lower(), GATEWAY_EMAIL.strip().lower())
     pwd_ok = _constant_time_compare(password, GATEWAY_PASSWORD)
-    if not (email_ok and pwd_ok):
+    credentials_configured = bool(GATEWAY_EMAIL.strip() and GATEWAY_PASSWORD)
+    if not (credentials_configured and email_ok and pwd_ok):
         html = LOGIN_HTML.replace(
             '{error_block}',
             '<p class="err">Incorrect email or password.</p>',

@@ -75,16 +75,16 @@ EXECUTION_COLORS = {
     'insufficient_data': '#b0bec5',
 }
 CHART_LABELS = {
-    'rank_score': 'Overall Rank',
-    'signal_score': 'Signal Score',
-    'estimated_cost_usd': 'Estimated Cost ($)',
-    'projected_profit_usd': 'Projected Profit ($)',
-    'projected_return_pct': 'Projected Return (%)',
-    'max_risk_usd': 'Maximum Risk ($)',
-    'allocation_pct': 'Position Size (%)',
-    'annualized_volatility': 'Annualized Volatility',
+    'rank_score': 'Overall Rank Score',
+    'signal_score': 'Signal Strength',
+    'estimated_cost_usd': 'Estimated Cost',
+    'projected_profit_usd': 'Projected Profit',
+    'projected_return_pct': 'Projected Return',
+    'max_risk_usd': 'Maximum Risk',
+    'allocation_pct': 'Position Size',
+    'annualized_volatility': 'Volatility',
     'ticker': 'Ticker',
-    'bias': 'Bias',
+    'bias': 'Market Bias',
 }
 
 
@@ -101,7 +101,8 @@ def check_startup_status() -> None:
         return
     
     latest_file = max(csv_files, key=lambda p: p.stat().st_mtime)
-    file_age_seconds = (datetime.now(timezone.utc) - pd.Timestamp(latest_file.stat().st_mtime, tz='UTC')).total_seconds()
+    latest_mtime = pd.to_datetime(latest_file.stat().st_mtime, unit='s', utc=True)
+    file_age_seconds = (datetime.now(timezone.utc) - latest_mtime).total_seconds()
     
     if file_age_seconds > 600:
         st.info(f'📋 Last data refresh: {int(file_age_seconds / 60)} minutes ago. Worker may be sleeping during off-hours.')
@@ -357,6 +358,7 @@ def ensure_queue_columns(df: pd.DataFrame) -> pd.DataFrame:
         'order_status': 'queued_for_review',
         'approval_status': 'pending',
         'approved_for_submit': False,
+        'discovery_quality_override': False,
         'risk_check': 'review',
         'last_submitted_at': '',
         'option_order_status': 'queued_for_review',
@@ -364,6 +366,10 @@ def ensure_queue_columns(df: pd.DataFrame) -> pd.DataFrame:
         'queue_refreshed_at_utc': '',
         'guardrail_status': 'pass',
         'guardrail_reason': 'Eligible under current exposure and concentration limits.',
+        'discovery_quality_score': 0.0,
+        'discovery_quality_status': 'unknown',
+        'discovery_quality_formula_version': '',
+        'discovery_quality_gate_reason': '',
         'current_name_exposure_pct': 0.0,
         'portfolio_exposure_after_trade_pct': 0.0,
         'comment': 'Review bid/ask spread, open interest, and event risk before sending.',
@@ -421,7 +427,7 @@ def dashboard_column_config() -> dict:
         'learning_adjustment': st.column_config.NumberColumn('Learning Lift', format='%.2f'),
         'long_rank_score': st.column_config.NumberColumn('Bullish Rank', format='%.2f'),
         'short_rank_score': st.column_config.NumberColumn('Bearish Rank', format='%.2f'),
-        'setup_quality': st.column_config.NumberColumn('Setup Quality', format='%d'),
+        'setup_quality': st.column_config.NumberColumn('Setup Quality Score', format='%d'),
         'thesis_strength': st.column_config.TextColumn('Thesis Strength'),
         'regime_alignment': st.column_config.TextColumn('Regime Fit'),
         'refinement_note': st.column_config.TextColumn('Refinement Note'),
@@ -434,7 +440,7 @@ def dashboard_column_config() -> dict:
         'projected_profit_usd': st.column_config.NumberColumn('Projected Profit', format='$%.2f'),
         'projected_return_pct': st.column_config.ProgressColumn('Projected Return', min_value=-50, max_value=250, format='%.1f%%'),
         'allocation_pct': st.column_config.ProgressColumn('Position Size', min_value=0, max_value=5, format='%.2f%%'),
-        'max_risk_usd': st.column_config.NumberColumn('Max Risk', format='$%.2f'),
+        'max_risk_usd': st.column_config.NumberColumn('Maximum Risk', format='$%.2f'),
         'advisor_note': st.column_config.TextColumn('Why This Idea'),
         'advisor_summary': st.column_config.TextColumn('Why This Idea'),
         'sell_plan': st.column_config.TextColumn('Exit Plan'),
@@ -443,30 +449,35 @@ def dashboard_column_config() -> dict:
         'opportunity_source': st.column_config.TextColumn('Idea Source'),
         'broker_route': st.column_config.TextColumn('Broker Route'),
         'order_status': st.column_config.TextColumn('Order Status'),
-        'execution_state': st.column_config.TextColumn('Execution Status'),
+        'execution_state': st.column_config.TextColumn('Execution State'),
         'execution_badge': st.column_config.TextColumn('Live Status'),
-        'guardrail_status': st.column_config.TextColumn('Guardrail'),
+        'guardrail_status': st.column_config.TextColumn('Guardrail Status'),
         'guardrail_reason': st.column_config.TextColumn('Guardrail Reason'),
         'sector': st.column_config.TextColumn('Sector'),
-        'correlation_bucket': st.column_config.TextColumn('Correlation Bucket'),
-        'asset_family': st.column_config.TextColumn('Asset Family'),
-        'current_name_exposure_pct': st.column_config.NumberColumn('Current Name Exposure', format='%.2f%%'),
-        'portfolio_exposure_after_trade_pct': st.column_config.NumberColumn('Projected Portfolio Exposure', format='%.2f%%'),
+        'correlation_bucket': st.column_config.TextColumn('Correlation Cluster'),
+        'asset_family': st.column_config.TextColumn('Asset Class'),
+        'current_name_exposure_pct': st.column_config.NumberColumn('Current Position Exposure', format='%.2f%%'),
+        'portfolio_exposure_after_trade_pct': st.column_config.NumberColumn('Portfolio Exposure After Trade', format='%.2f%%'),
         'current_sector_exposure_pct': st.column_config.NumberColumn('Current Sector Exposure', format='%.2f%%'),
-        'sector_exposure_after_trade_pct': st.column_config.NumberColumn('Projected Sector Exposure', format='%.2f%%'),
-        'current_bucket_exposure_pct': st.column_config.NumberColumn('Current Cluster Exposure', format='%.2f%%'),
-        'bucket_exposure_after_trade_pct': st.column_config.NumberColumn('Projected Cluster Exposure', format='%.2f%%'),
-        'approval_status': st.column_config.SelectboxColumn('Review Decision', options=['pending', 'approved', 'auto_approved', 'hold', 'rejected']),
-        'approved_for_submit': st.column_config.CheckboxColumn('Approve to Send', help='Turn this on only when you want the paper trade to be eligible for routing.'),
-        'risk_check': st.column_config.TextColumn('Risk Check'),
-        'last_submitted_at': st.column_config.TextColumn('Last Stock Send'),
-        'option_order_status': st.column_config.TextColumn('Option Order Status'),
-        'last_option_submitted_at': st.column_config.TextColumn('Last Option Send'),
-        'queue_refreshed_at_utc': st.column_config.TextColumn('Queue Refreshed'),
+        'sector_exposure_after_trade_pct': st.column_config.NumberColumn('Sector Exposure After Trade', format='%.2f%%'),
+        'current_bucket_exposure_pct': st.column_config.NumberColumn('Current Correlation Exposure', format='%.2f%%'),
+        'bucket_exposure_after_trade_pct': st.column_config.NumberColumn('Correlation Exposure After Trade', format='%.2f%%'),
+        'approval_status': st.column_config.SelectboxColumn('Approval Status', options=['pending', 'approved', 'auto_approved', 'hold', 'rejected']),
+        'approved_for_submit': st.column_config.CheckboxColumn('Ready to Send', help='Enable to mark this trade eligible for routing.'),
+        'discovery_quality_override': st.column_config.CheckboxColumn('Override Quality Gate', help='Enable only with explicit decision log approval.'),
+        'discovery_quality_score': st.column_config.NumberColumn('Quality Score', format='%.1f'),
+        'discovery_quality_status': st.column_config.TextColumn('Quality Status'),
+        'discovery_quality_formula_version': st.column_config.TextColumn('Formula Version'),
+        'discovery_quality_gate_reason': st.column_config.TextColumn('Quality Reason'),
+        'risk_check': st.column_config.TextColumn('Risk Status'),
+        'last_submitted_at': st.column_config.TextColumn('Last Submitted'),
+        'option_order_status': st.column_config.TextColumn('Option Status'),
+        'last_option_submitted_at': st.column_config.TextColumn('Last Option Submitted'),
+        'queue_refreshed_at_utc': st.column_config.TextColumn('Queue Last Refreshed'),
         'expiration_date': st.column_config.TextColumn('Expiry Date'),
         'strike_price': st.column_config.NumberColumn('Strike', format='%.2f'),
         'option_type': st.column_config.TextColumn('Option Type'),
-        'estimated_contract_cost_usd': st.column_config.NumberColumn('Estimated Premium', format='$%.2f'),
+        'estimated_contract_cost_usd': st.column_config.NumberColumn('Estimated Premium Cost', format='$%.2f'),
         'contract_name': st.column_config.TextColumn('Contract Name'),
         'comment': st.column_config.TextColumn('Review Notes'),
         'market_value': st.column_config.NumberColumn('Market Value', format='$%.2f'),
@@ -475,12 +486,12 @@ def dashboard_column_config() -> dict:
         'qty': st.column_config.NumberColumn('Shares', format='%.0f'),
         'action': st.column_config.TextColumn('Recommended Action'),
         'reason': st.column_config.TextColumn('Reasoning'),
-        'asset_class': st.column_config.TextColumn('Asset Type'),
-        'underlying_symbol': st.column_config.TextColumn('Underlying'),
+        'asset_class': st.column_config.TextColumn('Asset Class'),
+        'underlying_symbol': st.column_config.TextColumn('Underlying Ticker'),
         'close_or_exercise_plan': st.column_config.TextColumn('Auto Exit / Exercise Plan'),
-        'decision_window': st.column_config.TextColumn('Decision Window'),
-        'days_to_expiration': st.column_config.NumberColumn('Days to Expiry', format='%d'),
-        'recent_headline': st.column_config.TextColumn('Latest Headline'),
+        'decision_window': st.column_config.TextColumn('Decision Timeframe'),
+        'days_to_expiration': st.column_config.NumberColumn('Days to Expiration', format='%d'),
+        'recent_headline': st.column_config.TextColumn('Latest News Headline'),
         'headline': st.column_config.TextColumn('Headline'),
         'catalyst_type': st.column_config.TextColumn('Catalyst Type'),
         'source_symbol': st.column_config.TextColumn('Source Symbol'),
@@ -945,6 +956,29 @@ def _get_build_info() -> dict:
     return info
 
 
+def _fresh_worker_status_age_minutes() -> int | None:
+    """Age in minutes of a recent successful worker_status.csv row, else None."""
+    worker_file = OUTPUT_DIR / 'worker_status.csv'
+    if not worker_file.exists():
+        return None
+    try:
+        frame = pd.read_csv(worker_file)
+        if frame.empty:
+            return None
+        row = frame.iloc[0]
+        if str(row.get('success', '')).strip().lower() not in {'true', '1', 'yes'}:
+            return None
+        checked = pd.to_datetime(row.get('checked_at_utc'), utc=True, errors='coerce')
+        if pd.isna(checked):
+            return None
+        age_seconds = (pd.Timestamp.now(tz='UTC') - checked).total_seconds()
+    except Exception:
+        return None
+    if age_seconds > 1800:
+        return None
+    return max(int(age_seconds / 60), 0)
+
+
 def _get_worker_health() -> tuple[str, str, str]:
     """Returns (status_label, status_color, staleness_note) from monitor_status.csv."""
     status_file = OUTPUT_DIR / 'monitor_status.csv'
@@ -974,7 +1008,12 @@ def _get_worker_health() -> tuple[str, str, str]:
     if worker_status == 'error':
         return 'Worker Error', '#f87171', note[:120]
     if age_seconds > 1800:
-        return f'Stale ({age_min}m ago)', '#fb923c', f'Heartbeat overdue. Last seen {age_min}m ago.'
+        fallback_age_min = _fresh_worker_status_age_minutes()
+        if fallback_age_min is not None:
+            if fallback_age_min < 1:
+                return 'Running (just updated)', '#4ade80', ''
+            return f'Running ({fallback_age_min}m ago)', '#4ade80', ''
+        return f'Stale ({age_min}m ago)', '#fb923c', f'Monitor status heartbeat overdue. Last seen {age_min}m ago.'
     if recent_failures > 0:
         return f'Running ({recent_failures} past failures)', '#fbbf24', f'{recent_failures} logged failures.'
     if age_min < 1:
@@ -988,15 +1027,15 @@ def _get_worker_health() -> tuple[str, str, str]:
 # daily_control_check.py. Keep keys aligned with control_miss_reasons tokens.
 CONTROL_REASON_LABELS = {
     'monitor_stale': 'Worker heartbeat is stale',
-    'monitor_stale_hold': 'Trading held because the worker heartbeat is stale',
+    'monitor_stale_hold': 'Trading held—worker heartbeat is stale',
     'performance_stale': 'Performance data is stale',
-    'broker_auth_unauthorized': 'Broker authentication failed (401 Unauthorized)',
+    'broker_auth_unauthorized': 'Broker authentication failed (401)',
     'concentration_breach': 'Position concentration limit breached',
-    'error_count_24h': 'Elevated execution errors in the last 24 hours',
-    'blocked_count_24h': 'Too many blocked orders in the last 24 hours',
+    'error_count_24h': 'Elevated errors (24 hours)',
+    'blocked_count_24h': 'Too many blocked orders (24 hours)',
     'recent_expired_48h': 'Recently expired contracts detected',
-    'protective_exit_fill_rate': 'Protective exit fill rate is below the minimum',
-    'missing_required_inputs': 'Required input files are missing or empty',
+    'protective_exit_fill_rate': 'Protective exit fill rate below minimum',
+    'missing_required_inputs': 'Required input files missing or empty',
 }
 
 # Reasons that must block trading rather than act as soft warnings.
@@ -1008,10 +1047,11 @@ HARD_BLOCK_REASONS = {
 
 
 def _humanize_reason(token: str) -> str:
+    """Convert control hold reason tokens to human-readable labels."""
     token = str(token or '').strip()
     if not token:
         return ''
-    return CONTROL_REASON_LABELS.get(token, token.replace('_', ' ').capitalize())
+    return CONTROL_REASON_LABELS.get(token, token.replace('_', ' ').title())
 
 
 def _freshness(age_minutes: float | None, stale_after: float = 30.0) -> tuple[str, str]:
@@ -1057,7 +1097,7 @@ def build_operational_summary() -> dict:
                 crow = cdf.iloc[0]
                 control_miss = str(crow.get('control_miss', '')).strip().lower() in {'true', '1', 'yes'}
                 raw_reasons = str(crow.get('control_miss_reasons', '') or '')
-                control_reasons = [r for r in raw_reasons.split('|') if r.strip()]
+                control_reasons = [r for r in raw_reasons.split('|') if r.strip() and r.strip().lower() != 'nan']
     except Exception:
         pass
 
@@ -1101,11 +1141,12 @@ def build_operational_summary() -> dict:
     # Monitor heartbeat
     monitor_path = OUTPUT_DIR / 'monitor_status.csv'
     monitor_age = _file_age_minutes(monitor_path)
+    worker_health_label, worker_health_color, worker_health_note = _get_worker_health()
 
     # Per-signal rows for the transparency strip
     worker_fresh_label, worker_fresh_color = _freshness(monitor_age, stale_after=30.0)
     summary['items'].append((
-        'Worker heartbeat',
+        'Worker Heartbeat',
         worker_health_label,
         worker_health_color,
         'monitor_status.csv',
@@ -1116,7 +1157,7 @@ def build_operational_summary() -> dict:
     conn_color = '#4ade80' if conn_status == 'connected' else ('#f87171' if conn_status in {'unauthorized', 'error'} else '#fb923c')
     acct_fresh_label, acct_fresh_color = _freshness(account_age, stale_after=30.0)
     summary['items'].append((
-        'Broker connection',
+        'Broker Connection',
         conn_status.title(),
         conn_color,
         'broker_account_status.csv',
@@ -1127,7 +1168,7 @@ def build_operational_summary() -> dict:
     gate_color = '#4ade80' if gate_verdict == 'pass' else ('#f87171' if gate_verdict == 'fail' else '#fb923c')
     gate_fresh_label, gate_fresh_color = _freshness(gate_age, stale_after=60.0)
     summary['items'].append((
-        'Pre-live gate',
+        'Pre-Live Gate',
         gate_verdict.title(),
         gate_color,
         'pre_live_gate_report.json',
@@ -1136,14 +1177,14 @@ def build_operational_summary() -> dict:
     ))
 
     if control_miss is None:
-        control_label, control_color = 'No data', '#f87171'
+        control_label, control_color = 'No Data', '#f87171'
     elif control_miss:
-        control_label, control_color = 'Hold active', '#fb923c'
+        control_label, control_color = 'Hold Active', '#fb923c'
     else:
         control_label, control_color = 'Clear', '#4ade80'
     ctrl_fresh_label, ctrl_fresh_color = _freshness(control_age, stale_after=60.0)
     summary['items'].append((
-        'Control audit',
+        'Control Audit',
         control_label,
         control_color,
         'control_audit_latest.csv',
@@ -1657,8 +1698,8 @@ bias_options = sorted(candidates['bias'].dropna().unique())
 default_bias = list(bias_options)
 selected_bias = st.sidebar.multiselect('Bias', bias_options, default=default_bias)
 
-score_min = int(candidates['signal_score'].min())
-score_max = int(candidates['signal_score'].max())
+score_min = int(candidates['signal_score'].min()) if not candidates.empty else 0
+score_max = int(candidates['signal_score'].max()) if not candidates.empty else 10
 score_default = min(2, score_max)
 min_score = st.sidebar.slider('Minimum signal score', min_value=score_min, max_value=score_max, value=score_default)
 
@@ -1695,6 +1736,14 @@ if not broker_account_status.empty:
 elif not monitor_status.empty:
     current_market_state = str(monitor_status.iloc[0].get('market_status', 'unknown')).title()
 
+_trading_mode_raw = str(os.getenv('TRADING_MODE', 'paper')).strip().lower()
+_alpaca_base_url = str(os.getenv('ALPACA_BASE_URL', '')).strip()
+_broker_connection = 'Unknown'
+if not broker_account_status.empty:
+    _broker_connection = str(broker_account_status.iloc[0].get('connection_status', 'unknown')).replace('_', ' ').title()
+_mode_label = 'Alpaca Paper' if _trading_mode_raw == 'paper' else 'Alpaca Live'
+_mode_color = '#4ade80' if _trading_mode_raw == 'paper' else '#f87171'
+
 metric1, metric2, metric3, metric4, metric5, metric6 = st.columns(6)
 metric1.metric('Ready Ideas', int((filtered['options_setup'] != 'No trade').sum()) if not filtered.empty else 0)
 metric2.metric('Avg Expected Return', f'{avg_return:.1f}%')
@@ -1706,7 +1755,9 @@ metric6.metric('Exit Signals', exit_alerts_count)
 st.markdown(
     f"""
     <div class="status-strip">
-        <span class="status-pill"><strong>Mode:</strong> Paper</span>
+        <span class="status-pill"><strong>Mode:</strong> <span style="color:{_mode_color};">{_mode_label}</span></span>
+        <span class="status-pill"><strong>Broker:</strong> {_broker_connection}</span>
+        <span class="status-pill"><strong>Base URL:</strong> {(_alpaca_base_url or 'default').replace('https://', '')}</span>
         <span class="status-pill"><strong>Approval:</strong> {'Automatic' if runtime_settings['approval_mode'] == 'automatic' else 'Manual'}</span>
         <span class="status-pill"><strong>Routing:</strong> {'Auto send on' if runtime_settings['auto_submit'] else 'Preview only'}</span>
         <span class="status-pill"><strong>Exit Guardrails:</strong> {'Auto approve urgent' if runtime_settings['auto_approve_urgent_exits'] else 'Manual'}</span>
@@ -2551,7 +2602,7 @@ with auto_tab:
             width='stretch',
             hide_index=True,
             column_config=dashboard_column_config(),
-            disabled=['ticker', 'bias', 'options_setup', 'signal_score', 'projected_return_pct', 'max_risk_usd', 'allocation_pct', 'broker_route', 'order_status', 'risk_check', 'last_submitted_at', 'option_order_status', 'last_option_submitted_at', 'queue_refreshed_at_utc', 'guardrail_status', 'guardrail_reason', 'current_name_exposure_pct', 'portfolio_exposure_after_trade_pct'],
+            disabled=['ticker', 'bias', 'options_setup', 'signal_score', 'projected_return_pct', 'max_risk_usd', 'allocation_pct', 'broker_route', 'order_status', 'risk_check', 'last_submitted_at', 'option_order_status', 'last_option_submitted_at', 'queue_refreshed_at_utc', 'guardrail_status', 'guardrail_reason', 'discovery_quality_score', 'discovery_quality_status', 'discovery_quality_formula_version', 'discovery_quality_gate_reason', 'current_name_exposure_pct', 'portfolio_exposure_after_trade_pct'],
             key='paper_trade_queue_editor',
         )
 
@@ -2559,10 +2610,20 @@ with auto_tab:
             editable_queue = ensure_queue_columns(editable_queue)
             editable_queue['approval_status'] = editable_queue['approval_status'].astype(str).str.lower().replace({'nan': 'pending'})
             editable_queue['approved_for_submit'] = editable_queue['approved_for_submit'].fillna(False).astype(bool)
+            editable_queue['discovery_quality_override'] = editable_queue['discovery_quality_override'].fillna(False).astype(bool)
+            blocked_mask = (
+                editable_queue['discovery_quality_status'].astype(str).str.lower().eq('block')
+                & ~editable_queue['discovery_quality_override']
+            )
+            editable_queue.loc[blocked_mask, 'approval_status'] = 'hold'
+            editable_queue.loc[blocked_mask, 'approved_for_submit'] = False
             editable_queue.loc[editable_queue['approval_status'].isin(['approved', 'auto_approved']), 'approved_for_submit'] = True
             editable_queue.loc[editable_queue['approval_status'].isin(['rejected', 'hold']), 'approved_for_submit'] = False
             if selected_approval_mode == 'automatic':
-                auto_mask = editable_queue['approval_status'].isin(['pending', ''])
+                auto_mask = editable_queue['approval_status'].isin(['pending', '']) & (
+                    editable_queue['discovery_quality_status'].astype(str).str.lower().ne('block')
+                    | editable_queue['discovery_quality_override']
+                )
                 editable_queue.loc[auto_mask, 'approval_status'] = 'auto_approved'
                 editable_queue.loc[auto_mask, 'approved_for_submit'] = True
             editable_queue.to_csv(OUTPUT_DIR / 'paper_trade_queue.csv', index=False)

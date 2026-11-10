@@ -135,14 +135,25 @@ def _lookup_learning_feedback(ticker: str, learning_feedback: pd.DataFrame) -> t
 def _nearest_expiration(expirations: List[str], min_days: int = 21, max_days: int = 60) -> str | None:
     if not expirations:
         return None
+
+    candidates: List[tuple[str, int]] = []
     for exp in expirations:
         try:
             days = (pd.Timestamp(exp) - pd.Timestamp.today().normalize()).days
-            if min_days <= days <= max_days:
-                return exp
         except Exception:
             continue
-    return expirations[0] if expirations else None
+        if days >= 0:
+            candidates.append((exp, int(days)))
+
+    if not candidates:
+        return None
+
+    target_days = (min_days + max_days) // 2
+    within_range = [item for item in candidates if min_days <= item[1] <= max_days]
+    if not within_range:
+        return None
+
+    return min(within_range, key=lambda item: (abs(item[1] - target_days), item[1]))[0]
 
 
 def _pick_spread_strikes(last_close: float, bias: str, signal_score: int) -> tuple[float, float]:

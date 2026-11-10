@@ -379,9 +379,14 @@ def build_strategy_attribution(journal: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=STRATEGY_ATTRIBUTION_COLUMNS)
 
     working = journal.copy()
+    def _numeric_series(column: str, default: float = 0.0) -> pd.Series:
+        if column in working.columns:
+            return pd.to_numeric(working[column], errors='coerce').fillna(default)
+        return pd.Series(default, index=working.index, dtype='float64')
+
     working['strategy_bucket'] = working.get('execution_style', pd.Series('', index=working.index)).replace('', 'unclassified')
-    working['market_value'] = pd.to_numeric(working.get('market_value', 0.0), errors='coerce').fillna(0.0)
-    working['unrealized_pl'] = pd.to_numeric(working.get('unrealized_pl', 0.0), errors='coerce').fillna(0.0)
+    working['market_value'] = _numeric_series('market_value', 0.0)
+    working['unrealized_pl'] = _numeric_series('unrealized_pl', 0.0)
     grouped = working.groupby('strategy_bucket', dropna=False).agg(
         positions=('strategy_bucket', 'count'),
         winning_positions=('journal_status', lambda s: int(s.astype(str).eq('open_winner').sum())),
@@ -395,7 +400,20 @@ def build_strategy_attribution(journal: pd.DataFrame) -> pd.DataFrame:
     return grouped[STRATEGY_ATTRIBUTION_COLUMNS].sort_values(['total_unrealized_pl', 'strategy_bucket'], ascending=[False, True]).reset_index(drop=True)
 
 
-def build_execution_quality_report(execution_log: pd.DataFrame) -> pd.DataFrame:
+def _broker_orders_as_execution_log(broker_orders: pd.DataFrame) -> pd.DataFrame:
+    """Shape broker order history like an execution log so real fills are counted."""
+    ids = broker_orders.get('client_order_id', pd.Series('', index=broker_orders.index)).astype(str).str.lower()
+    style = pd.Series('unclassified', index=broker_orders.index)
+    style[ids.str.contains('-option-', na=False)] = 'single_leg_option_paper'
+    style[ids.str.contains('-exit-', na=False)] = 'protective_exit_paper'
+    status = broker_orders.get('status', pd.Series('', index=broker_orders.index))
+    return pd.DataFrame({'execution_style': style, 'status': status})
+
+
+def build_execution_quality_report(execution_log: pd.DataFrame, broker_orders: pd.DataFrame | None = None) -> pd.DataFrame:
+    # Execution-log statuses are submit-time only, so broker history is the source of truth for fills.
+    if broker_orders is not None and not broker_orders.empty:
+        execution_log = _broker_orders_as_execution_log(broker_orders)
     if execution_log.empty:
         return pd.DataFrame(columns=EXECUTION_QUALITY_COLUMNS)
 
@@ -428,9 +446,14 @@ def build_learning_feedback(journal: pd.DataFrame, execution_log: pd.DataFrame) 
         )
 
     working = journal.copy()
+    def _numeric_series(column: str, default: float = 0.0) -> pd.Series:
+        if column in working.columns:
+            return pd.to_numeric(working[column], errors='coerce').fillna(default)
+        return pd.Series(default, index=working.index, dtype='float64')
+
     working['ticker'] = working.get('underlying_symbol', pd.Series('', index=working.index)).replace('', pd.NA)
     working['ticker'] = working['ticker'].fillna(working.get('symbol', pd.Series('', index=working.index))).astype(str).str.upper()
-    working['unrealized_pl'] = pd.to_numeric(working.get('unrealized_pl', 0.0), errors='coerce').fillna(0.0)
+    working['unrealized_pl'] = _numeric_series('unrealized_pl', 0.0)
     working['is_winner'] = working.get('journal_status', pd.Series('', index=working.index)).astype(str).eq('open_winner')
 
     grouped = working.groupby('ticker', dropna=False).agg(
@@ -496,7 +519,7 @@ def build_learning_feedback(journal: pd.DataFrame, execution_log: pd.DataFrame) 
     return pd.concat([portfolio_row, grouped], ignore_index=True)
 
 
-def save_performance_outputs(project_dir: Path, journal: pd.DataFrame, exits: pd.DataFrame | None = None, execution_log: pd.DataFrame | None = None) -> tuple[Path, Path, Path, Path, Path, Path]:
+def save_performance_outputs(project_dir: Path, journal: pd.DataFrame, exits: pd.DataFrame | None = None, execution_log: pd.DataFrame | None = None, broker_orders: pd.DataFrame | None = None) -> tuple[Path, Path, Path, Path, Path, Path]:
     output_dir = project_dir / 'outputs'
     output_dir.mkdir(exist_ok=True)
 
@@ -510,7 +533,7 @@ def save_performance_outputs(project_dir: Path, journal: pd.DataFrame, exits: pd
     summary = build_performance_summary(journal)
     alerts = build_priority_alerts(journal, exits if exits is not None else pd.DataFrame())
     attribution = build_strategy_attribution(journal)
-    quality = build_execution_quality_report(execution_log if execution_log is not None else pd.DataFrame())
+    quality = build_execution_quality_report(execution_log if execution_log is not None else pd.DataFrame(), broker_orders)
     learning = build_learning_feedback(journal, execution_log if execution_log is not None else pd.DataFrame())
     journal.to_csv(journal_path, index=False)
     summary.to_csv(summary_path, index=False)

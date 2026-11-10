@@ -1,3 +1,7 @@
+from bootstrap_path import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
 from pathlib import Path
 
 from src.backtest import backtest_directional_signals

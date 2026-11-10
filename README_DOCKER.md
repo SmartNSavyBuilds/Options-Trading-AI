@@ -1,5 +1,95 @@
 # Options Dashboard Docker Runbook
 
+## Current Objective: Restore Remote Paper Trading
+
+### Objective
+
+Bring the existing `Trade-Agent-Prod` DigitalOcean Droplet back online and serve
+the authenticated trading dashboard at `https://trade.simplestudiotrades.com`.
+Keep the broker in paper mode throughout deployment. Do not enable order
+submission until the remote worker, account sync, risk gates, and actual order
+structure have been checked.
+
+### Last-known state
+
+- The DigitalOcean Droplet still existed but was shown offline; its displayed IP
+  was `134.209.79.232`. Confirm the Droplet and IP in DigitalOcean before use.
+- The public domain was configured for that IP, but public HTTP/HTTPS timed out
+  while the Droplet was offline. Recheck DNS after powering it on.
+- The local dashboard and gateway ran in Docker. The local paper worker synced
+  successfully with Alpaca after its paper credentials were updated.
+- The local `.env` was last configured with `TRADING_MODE=paper`,
+  `APPROVAL_MODE=automatic`, `AUTO_SUBMIT=false`, and
+  `CONFIRM_LIVE_TRADING=false`. The server has a separate `.env`; its values and
+  worker state must be verified independently.
+- Secrets in the attached `.env` have been exposed in chat. Treat them as
+  compromised and rotate them before using them on the Droplet. Never attach
+  `.env`, commit it, or put secret values in this runbook.
+- The options preview can describe a multi-leg spread while the current router
+  submits one option leg. Keep `AUTO_SUBMIT=false` until the preview and actual
+  order structure have been verified and this mismatch is resolved.
+
+### Ordered deployment checklist
+
+1. **Rotate exposed credentials.** Replace the Alpaca paper key pair, GitHub
+   token, Anthropic key, Discord webhook, gateway password, and gateway secret
+   key that were exposed. Update local `.env` directly. Create a separate,
+   secured `.env` on the Droplet; do not copy it through chat or Git.
+2. **Check the Droplet.** Resolve any DigitalOcean billing issue, confirm the
+  existing Droplet and displayed IP, then power it on. If it has been deleted,
+  check for a snapshot before creating a replacement.
+3. **Check DNS and firewalls.** Confirm the `trade` A record points to the
+  Droplet's current IP. Allow inbound TCP 22 from your IP, and TCP 80/443 from
+  the internet. Do not expose ports 8080 or 8502 publicly.
+4. **Connect to the server.** SSH into the Ubuntu Droplet. Confirm Docker Engine
+  and the Docker Compose plugin are installed and running. Keep SSH access
+  restricted to your IP where possible.
+5. **Deploy the code.** Put the current project code on the server without
+   copying local outputs or `.env`. Create the server `.env` from the rotated
+   values and set at minimum:
+
+   ```env
+   DOMAIN=trade.simplestudiotrades.com
+   TRADING_MODE=paper
+   AUTO_SUBMIT=false
+   CONFIRM_LIVE_TRADING=false
+   APPROVAL_MODE=automatic
+   SESSION_COOKIE_SECURE=true
+   SESSION_COOKIE_DOMAIN=.simplestudiotrades.com
+   ```
+
+   Also set the rotated gateway credentials, paper Alpaca pair, `TLS_EMAIL`,
+   and `STREAMLIT_ORIGIN=http://options-dashboard:8502`.
+6. **Start the secure stack.** From the project directory on the Droplet, run:
+
+   ```bash
+   bash deploy_remote.sh
+   ```
+
+7. **Verify services and data.** Confirm `options-dashboard`, `options-gateway`,
+   `options-worker`, and `options-proxy` are healthy. Check proxy logs for TLS
+   issuance, then verify fresh `monitor_status.csv`, `broker_account_status.csv`,
+   `control_audit_latest.csv`, and `pre_live_gate_report.json`. Broker mode must
+   say `paper` and connection status `connected`.
+8. **Verify the public URL.** Open `https://trade.simplestudiotrades.com`, sign
+   in, and confirm the dashboard loads and shows fresh worker and broker data.
+9. **Prevent duplicate routing.** After the remote worker is verified, stop the
+   local Docker worker and ensure the Windows Startup shortcut for the local
+   `market_monitor.py --loop` is removed. Run only one order-routing worker.
+10. **Enable paper submission only after review.** First fix and verify the
+    single-leg-versus-spread routing behavior and risk/exit controls. Only then
+    deliberately set `AUTO_SUBMIT=true` on the server and recreate the worker.
+    Keep `TRADING_MODE=paper` and `CONFIRM_LIVE_TRADING=false`.
+
+### Completion criteria
+
+- The public HTTPS URL loads the authenticated dashboard.
+- The single remote worker is healthy and its heartbeat is fresh.
+- Alpaca account and positions sync successfully in paper mode.
+- Control audit and pre-live gate are fresh and pass.
+- Order previews match the actual contracts, legs, quantities, and loss limits.
+- No live credentials or live routing are enabled during this deployment.
+
 ## What was added
 
 - `Dockerfile`

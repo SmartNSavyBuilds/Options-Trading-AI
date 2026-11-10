@@ -1,3 +1,7 @@
+from bootstrap_path import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
 from datetime import datetime
 from pathlib import Path
 

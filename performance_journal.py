@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from bootstrap_path import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
 from pathlib import Path
 
 import pandas as pd
@@ -21,9 +25,10 @@ def _load_latest_output(prefix: str) -> pd.DataFrame:
 def main() -> None:
     positions = _load_latest_output('broker_positions')
     execution_log = _load_latest_output('execution_log')
+    broker_orders = _load_latest_output('broker_orders')
     exits = _load_latest_output('exit_recommendations')
     journal = build_performance_journal(positions, execution_log)
-    journal_path, summary_path, alerts_path, attribution_path, quality_path, learning_path = save_performance_outputs(PROJECT_DIR, journal, exits, execution_log)
+    journal_path, summary_path, alerts_path, attribution_path, quality_path, learning_path = save_performance_outputs(PROJECT_DIR, journal, exits, execution_log, broker_orders)
 
     print('Performance journal generated:')
     print(journal_path)

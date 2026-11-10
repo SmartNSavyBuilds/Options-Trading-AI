@@ -13,9 +13,10 @@ from src.execution import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Route approved short-dated option ideas to Alpaca paper trading.')
+    parser = argparse.ArgumentParser(description='Route approved swing-horizon option ideas to Alpaca paper trading.')
     parser.add_argument('--top-n', type=int, default=int(os.getenv('MAX_OPTION_POSITIONS', '4')), help='How many option ideas to route on this cycle.')
-    parser.add_argument('--max-days', type=int, default=int(os.getenv('MAX_OPTION_DAYS', '10')), help='Maximum days to expiration for contract selection.')
+    parser.add_argument('--min-days', type=int, default=int(os.getenv('MIN_OPTION_DTE', '14')), help='Minimum days to expiration for contract selection.')
+    parser.add_argument('--max-days', type=int, default=int(os.getenv('MAX_OPTION_DAYS', '45')), help='Maximum days to expiration for contract selection.')
     return parser
 
 
@@ -24,10 +25,12 @@ def main() -> None:
     config = TradingConfig.from_env()
     config.use_proxy_equities = False
     account, positions = sync_broker_state(config)
-    preview, results = run_option_execution_cycle(config, max_days=max(args.max_days, 1), top_n=max(args.top_n, 1))
+    min_days = max(args.min_days, 1)
+    max_days = max(args.max_days, min_days)
+    preview, results = run_option_execution_cycle(config, min_days=min_days, max_days=max_days, top_n=max(args.top_n, 1))
 
     if preview.empty:
-        print('No approved short-dated option contracts are ready for routing.')
+        print('No approved option contracts within the DTE guardrails are ready for routing.')
         return
 
     preview_path = save_execution_preview(preview)

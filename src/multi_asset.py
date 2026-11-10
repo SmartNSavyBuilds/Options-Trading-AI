@@ -52,6 +52,12 @@ def normalize_crypto_signals(report: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+def _numeric_series(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column in frame.columns:
+        return pd.to_numeric(frame[column], errors='coerce').fillna(default)
+    return pd.Series(default, index=frame.index, dtype='float64')
+
+
 def build_crypto_watchlist(signals: pd.DataFrame) -> pd.DataFrame:
     if signals.empty:
         return pd.DataFrame(columns=CRYPTO_WATCHLIST_COLUMNS)
@@ -86,7 +92,7 @@ def build_crypto_watchlist(signals: pd.DataFrame) -> pd.DataFrame:
     working['generated_at_utc'] = datetime.now(timezone.utc).isoformat()
     working['conviction_label'] = working['signal_score'].map(_conviction_label)
     working['crypto_action'] = working.apply(_crypto_action, axis=1)
-    working['annualized_volatility'] = pd.to_numeric(working.get('annualized_volatility', 0.0), errors='coerce').fillna(0.0).round(3)
+    working['annualized_volatility'] = _numeric_series(working, 'annualized_volatility', 0.0).round(3)
     working['advisor_summary'] = working.get('advisor_summary', pd.Series('No crypto summary available.', index=working.index)).fillna('No crypto summary available.')
     watchlist = working[CRYPTO_WATCHLIST_COLUMNS].sort_values(['signal_score', 'ticker'], ascending=[False, True]).reset_index(drop=True)
     return watchlist
@@ -111,8 +117,8 @@ def build_market_regime_summary(signals: pd.DataFrame) -> pd.DataFrame:
     working = signals.copy()
     bullish_ratio = round(float(working['bias'].astype(str).str.lower().eq('bullish').mean()), 2)
     bearish_ratio = round(float(working['bias'].astype(str).str.lower().eq('bearish').mean()), 2)
-    avg_signal_score = round(float(pd.to_numeric(working.get('signal_score', 0.0), errors='coerce').fillna(0.0).mean()), 2)
-    avg_volatility = round(float(pd.to_numeric(working.get('annualized_volatility', 0.0), errors='coerce').fillna(0.0).mean()), 3)
+    avg_signal_score = round(float(_numeric_series(working, 'signal_score', 0.0).mean()), 2)
+    avg_volatility = round(float(_numeric_series(working, 'annualized_volatility', 0.0).mean()), 3)
 
     if bullish_ratio >= 0.6 and avg_signal_score >= 2:
         market_regime = 'risk_on'

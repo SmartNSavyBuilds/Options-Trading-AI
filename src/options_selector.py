@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import os
 from pathlib import Path
 from typing import Dict, List
 
@@ -8,6 +10,7 @@ import yfinance as yf
 
 from .multi_asset import build_market_regime_summary
 from .profit_estimator import estimate_trade_outcome
+from .market_data import stock_quote_midpoint
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / 'outputs'
@@ -170,7 +173,17 @@ def _pick_spread_strikes(last_close: float, bias: str, signal_score: int) -> tup
     return long_strike, short_strike
 
 
-def build_options_candidates(signal_report: pd.DataFrame, learning_feedback: pd.DataFrame | None = None) -> pd.DataFrame:
+def build_options_candidates(signal_report: pd.DataFrame, learning_feedback: pd.DataFrame | None = None, quote_client=None) -> pd.DataFrame:
+    from .execution import TradingConfig, _intraday_drift
+
+    if quote_client is None:
+        from alpaca.data.historical import StockHistoricalDataClient
+
+        config = TradingConfig.from_env()
+        if config.api_key and config.secret_key:
+            quote_client = StockHistoricalDataClient(config.api_key, config.secret_key)
+    max_drift = float(os.getenv('MAX_INTRADAY_DRIFT_PCT', '0.05'))
+    quote_max_age = float(os.getenv('MAX_QUOTE_AGE_SECONDS', '60'))
     rows: List[Dict[str, object]] = []
     regime_summary = build_market_regime_summary(signal_report)
     market_regime = str(regime_summary.iloc[0].get('market_regime', 'unknown')) if not regime_summary.empty else 'unknown'
@@ -180,7 +193,8 @@ def build_options_candidates(signal_report: pd.DataFrame, learning_feedback: pd.
         ticker = row['ticker']
         bias = row['bias']
         structure = row['suggested_structure']
-        last_close = float(row.get('last_close', 0))
+        raw_close = pd.to_numeric(row.get('last_close', 0), errors='coerce')
+        last_close = float(raw_close) if pd.notna(raw_close) and math.isfinite(float(raw_close)) else 0.0
         signal_score = int(row.get('signal_score', 0))
         annualized_volatility = float(row.get('annualized_volatility', 0.0))
 
@@ -188,14 +202,49 @@ def build_options_candidates(signal_report: pd.DataFrame, learning_feedback: pd.
         days_to_expiration = 30
         try:
             tk = yf.Ticker(ticker)
-            expiration = _nearest_expiration(list(tk.options))
+            expiration = _nearest_expiration(
+                list(tk.options), max_days=45 if structure in {'Bull call spread', 'Bear put spread'} else 60,
+            )
             if expiration:
                 days_to_expiration = max((pd.Timestamp(expiration) - pd.Timestamp.today().normalize()).days, 1)
         except Exception:
             expiration = None
 
-        long_strike, short_strike = _pick_spread_strikes(last_close, bias, signal_score)
+        midpoint = None
+        drift = None
+        rejection_code = ''
+        rejection_detail = ''
+        try:
+            if not math.isfinite(max_drift) or max_drift < 0:
+                raise ValueError('Invalid intraday drift threshold')
+            if quote_client is None:
+                raise ValueError('Stock market data credentials unavailable')
+            midpoint = stock_quote_midpoint(quote_client, ticker, quote_max_age)
+            drift = _intraday_drift(last_close, midpoint)
+            if drift is None:
+                raise ValueError('Signal reference price unavailable')
+            if abs(drift) > max_drift:
+                rejection_code = 'REJECTED_INTRADAY_DRIFT'
+                rejection_detail = f'Intraday drift {drift * 100:.2f}% exceeds {max_drift * 100:.2f}%.'
+        except Exception as exc:
+            rejection_code = 'REJECTED_SAFETY_DATA_UNAVAILABLE'
+            rejection_detail = f'Stock quote unavailable or invalid ({type(exc).__name__}).'
+
+        long_strike, short_strike = _pick_spread_strikes(midpoint if midpoint is not None else last_close, bias, signal_score)
         strike_width = abs(short_strike - long_strike)
+        spread_type = {'Bull call spread': 'bull_call_debit', 'Bear put spread': 'bear_put_debit'}.get(structure, '')
+        if spread_type and not rejection_code:
+            if not expiration:
+                rejection_code = 'REJECTED_SPREAD_EXPIRATION'
+                rejection_detail = 'No eligible 21-45 day expiration is available.'
+            elif long_strike <= 0 or short_strike <= 0 or long_strike == short_strike:
+                rejection_code = 'REJECTED_SPREAD_STRIKES'
+                rejection_detail = 'A vertical spread requires two distinct positive strikes.'
+            elif (spread_type == 'bull_call_debit' and (bias != 'bullish' or long_strike >= short_strike)) or (
+                spread_type == 'bear_put_debit' and (bias != 'bearish' or long_strike <= short_strike)
+            ):
+                rejection_code = 'REJECTED_SPREAD_STRIKES'
+                rejection_detail = 'Spread strike order or direction is invalid.'
 
         if structure == 'Bull call spread':
             setup = f'Buy {int(long_strike)}C / Sell {int(short_strike)}C'
@@ -206,6 +255,8 @@ def build_options_candidates(signal_report: pd.DataFrame, learning_feedback: pd.
         elif structure == 'Long put':
             setup = f'Buy {int(long_strike)}P'
         else:
+            setup = 'No trade'
+        if rejection_code:
             setup = 'No trade'
 
         estimates = estimate_trade_outcome(
@@ -243,6 +294,16 @@ def build_options_candidates(signal_report: pd.DataFrame, learning_feedback: pd.
 
         rows.append({
             'ticker': ticker,
+            'signal_close': last_close,
+            'spread_type': spread_type,
+            'spread_long_strike': long_strike if spread_type else None,
+            'spread_short_strike': short_strike if spread_type else None,
+            'spread_option_type': ('call' if spread_type == 'bull_call_debit' else 'put') if spread_type else '',
+            'spread_ratio_qty': 1 if spread_type else 0,
+            'underlying_midpoint': midpoint,
+            'intraday_drift_pct': drift * 100 if drift is not None else None,
+            'rejection_code': rejection_code,
+            'rejection_detail': rejection_detail,
             'bias': bias,
             'signal_score': signal_score,
             'rank_score': rank_score,

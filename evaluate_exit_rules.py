@@ -69,7 +69,8 @@ def apply_automatic_exit_guardrails(recommendations: pd.DataFrame, enable_auto_a
 def main() -> None:
     positions = _load_latest_output('broker_positions')
     signals = _load_latest_output('latest_signals')
-    recommendations = build_exit_recommendations(positions, signals)
+    broker_orders = _load_latest_output('broker_orders')
+    recommendations = build_exit_recommendations(positions, signals, broker_orders)
     recommendations = _preserve_existing_state(recommendations)
     auto_approve = str(os.getenv('AUTO_APPROVE_URGENT_EXITS', 'true')).strip().lower() in {'1', 'true', 'yes', 'on'}
     recommendations = apply_automatic_exit_guardrails(recommendations, enable_auto_approve=auto_approve)

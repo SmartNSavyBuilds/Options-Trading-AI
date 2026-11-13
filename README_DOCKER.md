@@ -25,9 +25,10 @@ structure have been checked.
 - Secrets in the attached `.env` have been exposed in chat. Treat them as
   compromised and rotate them before using them on the Droplet. Never attach
   `.env`, commit it, or put secret values in this runbook.
-- The options preview can describe a multi-leg spread while the current router
-  submits one option leg. Keep `AUTO_SUBMIT=false` until the preview and actual
-  order structure have been verified and this mismatch is resolved.
+- The options router supports guarded paper-only MLeg entries and atomic paired
+  closes, with fresh safety checks and broker-order reconciliation. Keep
+  `AUTO_SUBMIT=false`; this integration has mocked test coverage but has not
+  been authorized for unattended broker submission.
 
 ### Ordered deployment checklist
 

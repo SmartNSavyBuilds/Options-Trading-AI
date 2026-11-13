@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -39,9 +40,133 @@ def _parse_option_metadata(symbol: str) -> tuple[str, str | None, int | None]:
     return underlying, None, None
 
 
-def build_exit_recommendations(positions: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+def _paired_option_groups(positions: pd.DataFrame) -> dict[str, tuple[str, str]]:
+    groups: dict[tuple[str, str, str], list[tuple[str, str]]] = {}
+    for _, row in positions.iterrows():
+        symbol = str(row.get('symbol', '')).strip().upper()
+        match = re.fullmatch(r'([A-Z]{1,6})(\d{6})([CP])(\d{8})', symbol)
+        if not match:
+            continue
+        key = (match.group(1), match.group(2), match.group(3))
+        groups.setdefault(key, []).append((symbol, str(row.get('side', '')).strip().lower()))
+
+    paired: dict[str, tuple[str, str]] = {}
+    for (underlying, expiry, option_type), legs in groups.items():
+        sides = {side for _, side in legs}
+        if len(legs) < 2 or not {'long', 'short'}.issubset(sides):
+            continue
+        group_key = f'{underlying}-{expiry}-{option_type}'
+        paired_symbols = ','.join(sorted(symbol for symbol, _ in legs))
+        for symbol, _ in legs:
+            paired[symbol] = (group_key, paired_symbols)
+    return paired
+
+
+def _known_spread_legs(broker_orders: pd.DataFrame | None) -> tuple[dict[str, tuple[str, str]], set[str]]:
+    known: dict[str, tuple[str, str]] = {}
+    uncertain_underlyings: set[str] = set()
+    if broker_orders is None or broker_orders.empty:
+        return known, uncertain_underlyings
+
+    active_statuses = {'new', 'accepted', 'partially_filled', 'pending_new', 'filled'}
+    for _, order in broker_orders.iterrows():
+        if str(order.get('order_class', '')).strip().lower() != 'mleg':
+            continue
+        status = str(order.get('status', '')).strip().lower()
+        reconciliation = str(order.get('spread_reconciliation_status', '')).strip().lower()
+        filled = pd.to_numeric(order.get('filled_qty', 0), errors='coerce')
+        if status not in active_statuses and (pd.isna(filled) or float(filled) <= 0) and reconciliation not in {'unknown', 'mismatched'}:
+            continue
+        broker_id = str(order.get('order_id', order.get('client_order_id', 'unknown'))).strip()
+        group_key = f'mleg:{broker_id or "unknown"}'
+        underlying = str(order.get('underlying_symbol', '')).strip().upper()
+        try:
+            legs = json.loads(str(order.get('legs_json', '[]') or '[]'))
+        except (json.JSONDecodeError, TypeError):
+            legs = []
+        symbols = sorted({str(leg.get('symbol', '')).strip().upper() for leg in legs if isinstance(leg, dict) and leg.get('symbol')})
+        if symbols:
+            for symbol in symbols:
+                known[symbol] = (group_key, ','.join(symbols))
+        elif underlying:
+            uncertain_underlyings.add(underlying)
+    return known, uncertain_underlyings
+
+
+def _flagged(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'y', 'on', 'pending', 'flagged'}
+
+
+def _assignment_flagged(row: pd.Series) -> bool:
+    return any(_flagged(row.get(column, False)) for column in (
+        'early_assignment', 'early_assignment_flag', 'early_assignment_risk',
+        'assignment_pending', 'assignment_flag', 'exercise_pending',
+    ))
+
+
+def _spread_manual_review_reason(
+    paired_symbols: list[str],
+    positions: pd.DataFrame,
+    broker_orders: pd.DataFrame | None,
+) -> str:
+    if len(paired_symbols) != 2:
+        return 'Spread leg list is incomplete or ambiguous.'
+
+    position_rows = positions[positions['symbol'].astype(str).str.strip().str.upper().isin(paired_symbols)]
+    if len(position_rows) != 2 or set(position_rows['symbol'].astype(str).str.strip().str.upper()) != set(paired_symbols):
+        return 'A spread leg is missing from the current positions.'
+    sides = {
+        str(row.get('symbol', '')).strip().upper(): str(row.get('side', '')).strip().lower()
+        for _, row in position_rows.iterrows()
+    }
+    if set(sides.values()) != {'long', 'short'}:
+        return 'Spread legs do not have one long and one short position.'
+    quantities = pd.to_numeric(position_rows.get('qty', pd.Series(dtype=float)), errors='coerce')
+    if quantities.isna().any() or (quantities <= 0).any() or quantities.nunique() != 1:
+        return 'Spread leg quantities are mismatched or invalid.'
+    if any(_assignment_flagged(row) for _, row in position_rows.iterrows()):
+        return 'An early assignment or exercise flag requires manual review.'
+
+    if broker_orders is None or broker_orders.empty:
+        return ''
+    for _, order in broker_orders.iterrows():
+        if str(order.get('order_class', '')).strip().lower() != 'mleg':
+            continue
+        try:
+            legs = json.loads(str(order.get('legs_json', '[]') or '[]'))
+        except (json.JSONDecodeError, TypeError):
+            legs = []
+        order_symbols = {
+            str(leg.get('symbol', '')).strip().upper()
+            for leg in legs if isinstance(leg, dict) and leg.get('symbol')
+        }
+        underlying = str(order.get('underlying_symbol', '')).strip().upper()
+        if order_symbols and order_symbols != set(paired_symbols):
+            continue
+        if not order_symbols and underlying not in {symbol.rstrip('0123456789CP') for symbol in paired_symbols}:
+            continue
+        if any(_assignment_flagged(pd.Series(leg)) for leg in legs if isinstance(leg, dict)):
+            return 'A broker-reported early assignment or exercise flag requires manual review.'
+        status = str(order.get('status', '')).strip().lower()
+        reconciliation = str(order.get('spread_reconciliation_status', '')).strip().lower()
+        if status == 'partially_filled' or reconciliation in {'unknown', 'mismatched'}:
+            return 'Broker spread fills are partial or mismatched and require reconciliation.'
+        if status in {'new', 'accepted', 'pending_new', 'submitted'}:
+            return 'A broker spread order is still pending and requires reconciliation.'
+        if order_symbols != set(paired_symbols) or reconciliation != 'matched':
+            return 'Broker spread legs have not been fully reconciled.'
+    return ''
+
+
+def build_exit_recommendations(
+    positions: pd.DataFrame,
+    signals: pd.DataFrame,
+    broker_orders: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if positions.empty:
-        return pd.DataFrame(columns=['symbol', 'asset_class', 'underlying_symbol', 'side', 'qty', 'unrealized_pl_pct', 'signal_score', 'action', 'reason', 'close_or_exercise_plan', 'decision_window', 'expiration_date', 'days_to_expiration', 'exit_pct', 'priority', 'exit_approved', 'order_status', 'last_submitted_at'])
+        return pd.DataFrame(columns=['symbol', 'asset_class', 'underlying_symbol', 'side', 'qty', 'unrealized_pl_pct', 'signal_score', 'action', 'reason', 'close_or_exercise_plan', 'decision_window', 'expiration_date', 'days_to_expiration', 'exit_pct', 'priority', 'exit_approved', 'order_status', 'last_submitted_at', 'spread_lifecycle_status', 'spread_group_key', 'paired_symbols', 'spread_alert_required', 'spread_alert_detail'])
 
     signal_map = signals.rename(columns={'ticker': 'symbol'}).copy() if not signals.empty else pd.DataFrame(columns=['symbol'])
     signal_lookup = signal_map.set_index('symbol')[['signal_score', 'bias']].to_dict('index') if not signal_map.empty else {}
@@ -124,6 +249,65 @@ def build_exit_recommendations(positions: pd.DataFrame, signals: pd.DataFrame) -
 
     result = pd.DataFrame(rows)
     if not result.empty:
+        paired_groups = _paired_option_groups(positions)
+        known_spread_legs, uncertain_underlyings = _known_spread_legs(broker_orders)
+        original_actions = result.set_index(result['symbol'].astype(str).str.strip().str.upper())['action'].to_dict()
+        result['spread_alert_required'] = False
+        result['spread_alert_detail'] = ''
+        handled: set[int] = set()
+        for index, row in result.iterrows():
+            if index in handled:
+                continue
+            symbol = str(row.get('symbol', '')).strip().upper()
+            paired = paired_groups.get(symbol) or known_spread_legs.get(symbol)
+            if not paired and str(row.get('asset_class', '')).lower() == 'option' and str(row.get('underlying_symbol', '')).upper() in uncertain_underlyings:
+                paired = (f"mleg:{row.get('underlying_symbol', '')}", 'unknown legs')
+            result.at[index, 'spread_lifecycle_status'] = 'standalone'
+            result.at[index, 'spread_group_key'] = ''
+            result.at[index, 'paired_symbols'] = ''
+            if paired:
+                group_key, paired_symbols = paired
+                symbols = [] if paired_symbols.strip().lower() == 'unknown legs' else sorted({
+                    item.strip().upper() for item in paired_symbols.split(',') if item.strip()
+                })
+                member_mask = result['symbol'].astype(str).str.strip().str.upper().isin(symbols)
+                member_indices = result.index[member_mask].tolist()
+                if not member_indices:
+                    member_indices = [index]
+                reason = _spread_manual_review_reason(symbols, positions, broker_orders)
+                if reason:
+                    for member_index in member_indices:
+                        result.at[member_index, 'action'] = 'hold'
+                        result.at[member_index, 'reason'] = f'MANUAL_REVIEW_REQUIRED: {reason}'
+                        result.at[member_index, 'close_or_exercise_plan'] = 'Manual review required. Do not close this leg independently.'
+                        result.at[member_index, 'decision_window'] = 'Manual review required before any order.'
+                        result.at[member_index, 'exit_pct'] = 0.0
+                        result.at[member_index, 'priority'] = ACTION_PRIORITY['hold']
+                        result.at[member_index, 'exit_approved'] = False
+                        result.at[member_index, 'spread_lifecycle_status'] = 'MANUAL_REVIEW_REQUIRED'
+                        result.at[member_index, 'spread_alert_required'] = True
+                        result.at[member_index, 'spread_alert_detail'] = reason
+                        result.at[member_index, 'spread_group_key'] = group_key
+                        result.at[member_index, 'paired_symbols'] = ','.join(symbols) if symbols else paired_symbols
+                        handled.add(member_index)
+                    continue
+
+                group_actions = [original_actions.get(item, 'hold') for item in symbols]
+                spread_action = min(group_actions, key=lambda action: ACTION_PRIORITY.get(action, 9))
+                for member_index in member_indices:
+                    result.at[member_index, 'action'] = spread_action
+                    result.at[member_index, 'reason'] = (
+                        'Close the healthy matched vertical as one atomic paired order.'
+                        if spread_action != 'hold' else 'Matched vertical remains within its current exit thresholds.'
+                    )
+                    result.at[member_index, 'close_or_exercise_plan'] = 'Close both matched option legs together with one MLeg order.'
+                    result.at[member_index, 'decision_window'] = 'Review the paired close at the next execution cycle.'
+                    result.at[member_index, 'exit_pct'] = ACTION_EXIT_PCT.get(spread_action, 0.0)
+                    result.at[member_index, 'priority'] = ACTION_PRIORITY.get(spread_action, 9)
+                    result.at[member_index, 'spread_lifecycle_status'] = 'healthy_matched'
+                    result.at[member_index, 'spread_group_key'] = group_key
+                    result.at[member_index, 'paired_symbols'] = ','.join(symbols)
+                    handled.add(member_index)
         result = result.sort_values(['priority', 'symbol'], ascending=[True, True])
     return result
 

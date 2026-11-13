@@ -79,10 +79,26 @@ def load_candidates() -> pd.DataFrame:
         'options_setup': 'No trade',
         'bias': 'neutral',
         'signal_score': 0,
+        'signal_close': 0.0,
+        'underlying_midpoint': 0.0,
+        'intraday_drift_pct': 0.0,
+        'rejection_code': '',
+        'rejection_detail': '',
     }
     for col, default in defaults.items():
         if col not in df.columns:
             df[col] = default
+    discovery_path = OUTPUT_DIR / 'opportunity_discovery.csv'
+    if discovery_path.exists():
+        try:
+            discovery = pd.read_csv(discovery_path)
+            columns = ['ticker', 'catalyst_checked_at_utc', 'catalyst_status',
+                       'catalyst_reason', 'earnings_dates', 'headline_count_60m']
+            if all(column in discovery.columns for column in columns):
+                df = df.drop(columns=[column for column in columns[1:] if column in df.columns])
+                df = df.merge(discovery[columns].drop_duplicates('ticker', keep='last'), on='ticker', how='left')
+        except (OSError, ValueError, pd.errors.ParserError):
+            pass
     return df
 
 
@@ -307,9 +323,42 @@ def build_paper_trade_queue(
     if candidates.empty:
         return pd.DataFrame()
 
+    rejection_codes = candidates.get('rejection_code', pd.Series('', index=candidates.index)).fillna('').astype(str)
+    rejected = candidates.loc[rejection_codes.str.startswith('REJECTED_')].copy()
+    if not rejected.empty:
+        defaults = {
+            'signal_close': 0.0, 'underlying_midpoint': 0.0, 'intraday_drift_pct': 0.0,
+            'spread_type': '', 'spread_long_strike': None, 'spread_short_strike': None,
+            'spread_option_type': '', 'spread_ratio_qty': 0, 'expiration_target': '', 'days_to_expiration': None,
+            'rejection_detail': '', 'catalyst_checked_at_utc': '', 'catalyst_status': 'UNKNOWN',
+            'catalyst_reason': '', 'earnings_dates': '', 'headline_count_60m': None,
+            'discovery_quality_score': 0.0, 'discovery_quality_status': 'unknown',
+            'discovery_quality_formula_version': '', 'discovery_quality_gate_reason': '',
+            'current_name_exposure_pct': 0.0, 'portfolio_exposure_after_trade_pct': 0.0,
+            'sector': '', 'correlation_bucket': '', 'asset_family': '',
+            'current_sector_exposure_pct': 0.0, 'sector_exposure_after_trade_pct': 0.0,
+            'current_bucket_exposure_pct': 0.0, 'bucket_exposure_after_trade_pct': 0.0,
+        }
+        for column, default in defaults.items():
+            if column not in rejected.columns:
+                rejected[column] = default
+        rejected['broker_route'] = 'alpaca-paper'
+        rejected['order_status'] = 'blocked'
+        rejected['option_order_status'] = 'blocked'
+        rejected['approval_status'] = 'hold'
+        rejected['approved_for_submit'] = False
+        rejected['discovery_quality_override'] = False
+        rejected['last_submitted_at'] = ''
+        rejected['last_option_submitted_at'] = ''
+        rejected['queue_refreshed_at_utc'] = datetime.now(timezone.utc).isoformat()
+        rejected['guardrail_status'] = 'blocked'
+        rejected['guardrail_reason'] = rejected['rejection_detail'].fillna('')
+        rejected['comment'] = rejected['rejection_detail'].fillna('')
+
     queue = candidates.copy()
     queue = queue[
-        queue['options_setup'].ne('No trade')
+        rejection_codes.eq('')
+        & queue['options_setup'].ne('No trade')
         & queue['signal_score'].ge(min_signal_score)
         & queue['projected_return_pct'].ge(min_projected_return)
         & queue['allocation_pct'].gt(0)
@@ -321,7 +370,29 @@ def build_paper_trade_queue(
         queue = queue[~queue['ticker'].astype(str).str.upper().isin(existing)].copy()
 
     if queue.empty:
-        return pd.DataFrame()
+        return rejected
+
+    for column, default in {
+        'signal_close': 0.0,
+        'spread_type': '',
+        'spread_long_strike': None,
+        'spread_short_strike': None,
+        'spread_option_type': '',
+        'spread_ratio_qty': 0,
+        'expiration_target': '',
+        'days_to_expiration': None,
+        'underlying_midpoint': 0.0,
+        'intraday_drift_pct': 0.0,
+        'rejection_code': '',
+        'rejection_detail': '',
+        'catalyst_checked_at_utc': '',
+        'catalyst_status': 'UNKNOWN',
+        'catalyst_reason': '',
+        'earnings_dates': '',
+        'headline_count_60m': None,
+    }.items():
+        if column not in queue.columns:
+            queue[column] = default
 
     queue = apply_exposure_guardrails(
         queue,
@@ -336,6 +407,8 @@ def build_paper_trade_queue(
         max_options_exposure_pct=max_options_exposure_pct,
     )
     if queue.empty:
+        if not rejected.empty:
+            return rejected
         return pd.DataFrame(columns=[
             'ticker', 'bias', 'options_setup', 'signal_score', 'projected_return_pct', 'max_risk_usd',
             'allocation_pct', 'broker_route', 'order_status', 'approval_status', 'approved_for_submit',
@@ -358,10 +431,34 @@ def build_paper_trade_queue(
     queue['comment'] = queue.get('guardrail_reason', 'Review bid/ask spread, open interest, and event risk. Change approval_status to approved only after manual review.')
     queue = _preserve_existing_state(queue)
     queue = _apply_discovery_quality_gate(queue)
+    catalyst_blocked = queue['catalyst_status'].fillna('UNKNOWN').astype(str).str.upper().eq('MANUAL_REVIEW_REQUIRED')
+    queue.loc[catalyst_blocked, 'approval_status'] = 'hold'
+    queue.loc[catalyst_blocked, 'approved_for_submit'] = False
+    queue.loc[catalyst_blocked, 'rejection_code'] = 'REJECTED_CATALYST_BLACKOUT'
+    queue.loc[catalyst_blocked, 'rejection_detail'] = queue.loc[catalyst_blocked, 'catalyst_reason'].fillna('')
+    if not rejected.empty:
+        queue = pd.concat([queue, rejected], ignore_index=True)
     return queue[
         [
             'ticker',
             'bias',
+            'signal_close',
+            'spread_type',
+            'spread_long_strike',
+            'spread_short_strike',
+            'spread_option_type',
+            'spread_ratio_qty',
+            'expiration_target',
+            'days_to_expiration',
+            'underlying_midpoint',
+            'intraday_drift_pct',
+            'rejection_code',
+            'rejection_detail',
+            'catalyst_checked_at_utc',
+            'catalyst_status',
+            'catalyst_reason',
+            'earnings_dates',
+            'headline_count_60m',
             'options_setup',
             'signal_score',
             'projected_return_pct',

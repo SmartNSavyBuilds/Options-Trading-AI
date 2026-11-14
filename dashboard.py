@@ -2591,6 +2591,9 @@ with auto_tab:
     st.subheader('Paper Trading Queue')
     queue = trade_queue.copy() if not trade_queue.empty else build_paper_trade_queue(filtered)
     queue = ensure_queue_columns(queue)
+    for column in ('sector', 'correlation_bucket', 'asset_family'):
+        if column in queue.columns:
+            queue[column] = queue[column].fillna('').astype(str)
 
     if queue.empty:
         st.info('No current ideas meet the paper trading gate. Lower the filters or regenerate signals.')

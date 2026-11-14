@@ -1,4 +1,28 @@
 services:
+  options-api:
+    build: .
+    container_name: options-api
+    env_file:
+      - .env
+    environment:
+      OPTIONS_API_OUTPUTS_DIR: /app/outputs
+      OPTION_SAFETY_DB: /app/outputs/options_safety.sqlite3
+      OPTIONS_API_COOKIE_SECURE: "true"
+    command: python -m uvicorn options_api:app --host 0.0.0.0 --port 8080
+    expose:
+      - "8080"
+    volumes:
+      - ./outputs:/app/outputs:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health/ready')"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   options-dashboard:
     build: .
     container_name: options-dashboard
@@ -63,7 +87,9 @@ services:
       options-dashboard:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+    expose:
+      - "8080"
     restart: unless-stopped
     healthcheck:
       test:

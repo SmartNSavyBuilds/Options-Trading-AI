@@ -1,7 +1,7 @@
 {$DOMAIN} {
     encode zstd gzip
 
-    reverse_proxy options-gateway:8080
+    reverse_proxy options-api:8080
 
     tls {$TLS_EMAIL}
 

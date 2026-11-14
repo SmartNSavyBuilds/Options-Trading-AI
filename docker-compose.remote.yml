@@ -10,7 +10,7 @@ services:
     profiles:
       - secure
     depends_on:
-      options-gateway:
+      options-api:
         condition: service_healthy
     ports:
       - "80:80"

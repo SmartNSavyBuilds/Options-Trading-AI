@@ -1,0 +1,67 @@
+Trade Agent Discord Notification Debug Commands
+
+Purpose
+- Verify the worker is running patched notification code.
+- Confirm Discord webhook works from inside the same container.
+- Trigger a trade run and inspect the exact notification path.
+
+1) Verify imported module and notification code markers
+Command:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml exec options-worker python -c "import inspect,src.execution as e; s=inspect.getsource(e.notify_discord); print('module_file=', e.__file__); print('has_discord_failed_string=', 'Discord notification failed ' in s); print('has_status_check=', 'response.status_code in {200, 204}' in s); print('has_response_snippet_log=', 'response.text[:300]' in s)"
+Definition:
+- Shows the file Python imported for src.execution.
+- Confirms the notify_discord function contains expected patched checks/logging.
+
+2) Webhook smoke test from inside options-worker
+Command:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml exec options-worker python -c "import os,requests; u=os.getenv('DISCORD_WEBHOOK_URL',''); print('has_webhook=', bool(u)); print('prefix=', u[:45]); r=requests.post(u, json={'content':'options-worker webhook smoke test'}, timeout=10); print('status=', r.status_code); print('body=', r.text[:200])"
+Definition:
+- Verifies env var exists in the running worker.
+- Posts directly to Discord and prints HTTP status/body.
+
+3) Execute one cycle and check worker logs
+Command A:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml exec options-worker python execute_option_trades.py --top-n 1
+Command B:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml logs --tail=200 options-worker
+Definition:
+- Forces one decision/submit cycle.
+- Shows whether the path was submitted, skipped_existing, blocked, or errored.
+
+4) If container code is stale, rebuild worker
+Command:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml up -d --build options-worker
+Definition:
+- Rebuilds and restarts only options-worker with latest code.
+
+4b) If DISCORD_WEBHOOK_URL is missing inside container, fix remote .env and recreate worker
+Command A:
+grep -n '^DISCORD_WEBHOOK_URL=' .env
+Command B:
+sed -i 's|^DISCORD_WEBHOOK_URL=.*|DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1517255289160732903/O_C6ihN84l2CmsSiCM_x8h3-LuNMeb8hCyzplrh7BMUUH2PIkfZBHoxi-tHCJUfkLmnR|' .env
+Command C:
+grep -n '^DISCORD_WEBHOOK_URL=' .env
+Command D:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml up -d --force-recreate options-worker
+Definition:
+- Verifies the line exists in the droplet .env.
+- Replaces it in place with the webhook value.
+- Recreates the worker so the env var is loaded into the process.
+
+5) Optional direct grep sanity checks
+Command A:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml exec options-worker sh -lc 'grep -n "def notify_discord" /app/src/execution.py'
+Command B:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml exec options-worker sh -lc 'grep -n "response.status_code in {200, 204}" /app/src/execution.py'
+Command C:
+docker compose -f docker-compose.yml -f docker-compose.remote.yml exec options-worker sh -lc 'grep -n "response.text\[:300\]" /app/src/execution.py'
+Definition:
+- Confirms expected code lines exist in the container file.
+
+Quick interpretation guide
+- module_file points to unexpected path: wrong code location/import path.
+- has_* values false: old code in running container.
+- webhook status 200 or 204: Discord endpoint accepted payload.
+- webhook status 401 or 403: webhook invalid/permissions/channel issue.
+- webhook status 404: webhook URL is dead/rotated.
+- trade run shows skipped_existing and still no notification: verify _notify_and_return path in imported code and post logs.

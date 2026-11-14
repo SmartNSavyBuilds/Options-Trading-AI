@@ -1,4 +1,56 @@
-# Options Dashboard Docker Runbook
+# Options Monitoring Web Stack Runbook
+
+## Current Web Stack
+
+The current UI is a static mobile PWA served by `options-api`. The API reads
+allowlisted CSV reports and the IV-history SQLite database from `./outputs`
+through a read-only mount. Caddy is the only public web ingress and forwards
+HTTPS to the API. Streamlit and its gateway remain as a temporary legacy path;
+the new API exposes no trade, queue-edit, worker-control, or broker-submit
+endpoints.
+
+### Authentication setup
+
+Set these values in the private project `.env` on the deployment host:
+
+```env
+OPTIONS_API_EMAIL=your-login-email
+OPTIONS_API_PASSWORD_HASH=
+OPTIONS_API_JWT_SECRET=
+OPTIONS_API_ALLOWED_ORIGINS=https://trade.simplestudiotrades.com
+OPTIONS_API_COOKIE_SECURE=true
+```
+
+Generate the password hash interactively from the project directory with
+`python options_api.py --hash-password`. Generate a JWT key with
+`python -c "import secrets; print(secrets.token_urlsafe(48))"`. Keep both
+outputs private; never paste `.env` into chat or logs. Missing values keep the
+API unready and protected endpoints fail closed.
+
+### Local configuration check
+
+```powershell
+docker compose config --quiet
+docker compose ps
+```
+
+The first command validates Compose without printing resolved environment
+values. The API has no published host port; Caddy routes the site and API over
+the Compose network. The worker keeps read/write access to `./outputs`; the API
+and wiki ingestion service mount it read-only.
+
+### Deployment and verification
+
+After reviewing configuration and explicitly approving deployment, run
+`bash deploy_remote.sh` from the Droplet project directory. Verify
+`options-api`, `options-proxy`, `options-worker`, and `options-wiki-ingest` with
+`docker compose -f docker-compose.yml -f docker-compose.remote.yml --profile secure ps`.
+Check `https://trade.simplestudiotrades.com/login` and the API liveness route at
+`https://trade.simplestudiotrades.com/api/v1/health/live`. The readiness route
+also requires the outputs volume, IV database, and API authentication settings.
+Do not expose the legacy gateway on a public HTTP port.
+
+## Historical Streamlit Deployment Notes (Superseded)
 
 ## Current Objective: Restore Remote Paper Trading
 
@@ -91,7 +143,7 @@ structure have been checked.
 - Order previews match the actual contracts, legs, quantities, and loss limits.
 - No live credentials or live routing are enabled during this deployment.
 
-## What was added
+## What was added to the legacy Streamlit stack
 
 - `Dockerfile`
 - `docker-compose.yml`
@@ -110,7 +162,7 @@ Additional hardening assets:
 - `run_pre_live_gate_check.ps1`
 - `.env.example`
 
-## Start the dashboard in Docker
+## Start the legacy Streamlit dashboard in Docker
 
 From `c:\claw-code\projects\options_trading_ai`:
 

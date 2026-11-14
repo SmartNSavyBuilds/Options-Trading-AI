@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101513">
+  <meta name="description" content="Read-only paper portfolio and risk monitor.">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <title>Options Monitor</title>
+</head>
+<body>
+  <main id="login-view" class="login-layout" hidden>
+    <section class="login-panel" aria-labelledby="login-title">
+      <div class="brand-mark" aria-hidden="true">O</div>
+      <p class="eyebrow">PAPER ACCOUNT</p>
+      <h1 id="login-title">Options monitor</h1>
+      <p class="muted">Secure sign in</p>
+      <form id="login-form">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="username" required>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button class="button button-primary login-submit" type="submit">Sign in</button>
+        <p id="login-error" class="form-error" role="alert" hidden></p>
+      </form>
+    </section>
+  </main>
+
+  <div id="app-view" class="app-shell" hidden>
+    <header class="topbar">
+      <a class="wordmark" href="/" aria-label="Options Monitor home"><span class="brand-mark">O</span><span>Options<span class="wordmark-light">Monitor</span></span></a>
+      <div class="topbar-actions">
+        <span class="mode-pill"><span class="status-dot"></span>Paper</span>
+        <button id="refresh-button" class="button button-quiet" type="button" title="Refresh data" aria-label="Refresh data"><span aria-hidden="true">↻</span><span class="refresh-label">Refresh</span></button>
+        <button id="logout-button" class="button button-quiet" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="page-heading">
+        <div>
+          <p class="eyebrow">PORTFOLIO / PAPER</p>
+          <h1>Command center</h1>
+          <p id="updated-at" class="muted">Waiting for data</p>
+        </div>
+        <div id="overall-status" class="status-badge status-neutral"><span class="status-dot"></span><span>Connecting</span></div>
+      </section>
+
+      <section class="status-strip" aria-label="System status">
+        <div class="status-item"><span class="status-label">Worker</span><strong id="worker-status">Checking</strong></div>
+        <div class="status-item"><span class="status-label">Broker</span><strong id="broker-status">Checking</strong></div>
+        <div class="status-item"><span class="status-label">Control gate</span><strong id="gate-status">Checking</strong></div>
+      </section>
+
+      <section class="metrics-grid" aria-label="Portfolio performance">
+        <article class="metric metric-primary"><span class="metric-label">Open positions</span><strong id="metric-positions">--</strong><span id="metric-position-detail" class="metric-foot">--</span></article>
+        <article class="metric"><span class="metric-label">Market value</span><strong id="metric-market-value">--</strong><span class="metric-foot">Current open book</span></article>
+        <article class="metric"><span class="metric-label">Unrealized P/L</span><strong id="metric-pnl">--</strong><span id="metric-pnl-detail" class="metric-foot">--</span></article>
+        <article class="metric"><span class="metric-label">Execution fill rate</span><strong id="metric-fill-rate">--</strong><span id="metric-fill-detail" class="metric-foot">Latest report</span></article>
+      </section>
+
+      <section class="data-section" aria-labelledby="positions-heading">
+        <div class="section-heading"><div><p class="eyebrow">LIVE ACCOUNT SNAPSHOT</p><h2 id="positions-heading">Open positions</h2></div><span id="positions-count" class="section-count">--</span></div>
+        <div class="table-wrap"><table><thead><tr><th>Contract</th><th>Side</th><th>Qty</th><th>Market value</th><th>Unrealized P/L</th></tr></thead><tbody id="positions-body"><tr><td class="table-empty" colspan="5">Loading positions</td></tr></tbody></table></div>
+      </section>
+
+      <div class="lower-grid">
+        <section class="data-section" aria-labelledby="iv-heading">
+          <div class="section-heading"><div><p class="eyebrow">VOLATILITY HISTORY</p><h2 id="iv-heading">IV ranks</h2></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>ATM IV</th><th>IV rank</th><th>Observations</th></tr></thead><tbody id="iv-body"><tr><td class="table-empty" colspan="4">Loading IV history</td></tr></tbody></table></div>
+        </section>
+        <section class="data-section" aria-labelledby="guardrails-heading">
+          <div class="section-heading"><div><p class="eyebrow">RISK REVIEW</p><h2 id="guardrails-heading">Guardrail activity</h2></div><span id="guardrail-count" class="section-count">--</span></div>
+          <div id="guardrails-list" class="activity-list"><p class="table-empty">Loading guardrails</p></div>
+        </section>
+      </div>
+      <p id="api-error" class="api-error" role="status" hidden></p>
+      <footer class="footer"><span>Read-only monitor</span><span id="footer-time">No refresh yet</span></footer>
+    </main>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

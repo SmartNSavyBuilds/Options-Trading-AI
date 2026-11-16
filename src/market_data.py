@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Dict, Iterable
 
 import pandas as pd
 import yfinance as yf
+
+from .quant.contracts import QuoteSnapshot, to_epoch_ms, utc_now_ms
+
+
+LATEST_OPTION_QUOTES: OrderedDict[str, QuoteSnapshot] = OrderedDict()
+_OPTION_QUOTE_CACHE_LIMIT = 512
 
 
 DEFAULT_TICKERS = [
@@ -58,7 +65,34 @@ def option_snapshot_metrics(client, symbol: str, max_age_seconds: float = 60.0) 
     if not math.isfinite(implied_volatility) or implied_volatility <= 0:
         raise ValueError('Option implied volatility is unavailable')
     midpoint = (bid + ask) / 2.0
+    try:
+        from .quant.telemetry import telemetry_enabled
+
+        if telemetry_enabled():
+            LATEST_OPTION_QUOTES[contract] = QuoteSnapshot(
+                symbol=contract,
+                bid=bid,
+                ask=ask,
+                bid_size=_optional_quote_size(quote, 'bid_size'),
+                ask_size=_optional_quote_size(quote, 'ask_size'),
+                quote_ts_ms=to_epoch_ms(timestamp),
+                captured_ts_ms=utc_now_ms(),
+            )
+            LATEST_OPTION_QUOTES.move_to_end(contract)
+            while len(LATEST_OPTION_QUOTES) > _OPTION_QUOTE_CACHE_LIMIT:
+                LATEST_OPTION_QUOTES.popitem(last=False)
+    except Exception:
+        pass
     return midpoint, (ask - bid) / midpoint, implied_volatility
+
+
+def _optional_quote_size(quote, field: str) -> float | None:
+    value = getattr(quote, field, None)
+    try:
+        size = float(value)
+        return size if math.isfinite(size) and size >= 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_download_frame(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:

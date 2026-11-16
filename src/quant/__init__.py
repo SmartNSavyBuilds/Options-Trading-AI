@@ -1,0 +1,1 @@
+"""Isolated research and execution telemetry primitives."""

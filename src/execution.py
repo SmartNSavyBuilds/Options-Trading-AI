@@ -837,6 +837,7 @@ def _submit_paper_debit_vertical(
 
     payload = request.model_dump(exclude_none=True, mode='json')
     base_result = {**base_result, 'limit_price': format(limit_debit, '.2f'), 'iv_rank_source': rank_source}
+    submit_started_ms = time.time_ns() // 1_000_000
     try:
         response = requests.request(
             method='POST', url=f'{config.base_url}/v2/orders', headers=_broker_headers(config),
@@ -844,6 +845,12 @@ def _submit_paper_debit_vertical(
         )
         response.raise_for_status()
         body = response.json()
+        _record_quant_spread_event(
+            'submit', order, event_ts_ms=submit_started_ms,
+            broker_order_id=str(body.get('id') or '') if isinstance(body, dict) else None,
+            ack_latency_ms=max(0, time.time_ns() // 1_000_000 - submit_started_ms),
+            extra={'broker_status': body.get('status', '') if isinstance(body, dict) else ''},
+        )
         if not isinstance(body, dict) or not body.get('id') or not body.get('status'):
             reconciled = _mleg_submission_result(order, config, body if isinstance(body, dict) else None)
             return {**base_result, **reconciled}
@@ -853,6 +860,11 @@ def _submit_paper_debit_vertical(
             return {**base_result, **reconciled}
         return {**base_result, **_mleg_submission_result(order, config, body, reconcile=False)}
     except Exception as exc:
+        _record_quant_spread_event(
+            'submit', order, event_ts_ms=submit_started_ms,
+            ack_latency_ms=max(0, time.time_ns() // 1_000_000 - submit_started_ms),
+            extra={'submission_error': type(exc).__name__},
+        )
         reconciled = _mleg_submission_result(order, config, None, request_error=exc)
         return {**base_result, **reconciled}
 
@@ -915,6 +927,7 @@ def _submit_paper_vertical_close(
 
     payload = request.model_dump(exclude_none=True, mode='json')
     base_result = {**base_result, 'limit_price': format(limit_price, '.2f')}
+    submit_started_ms = time.time_ns() // 1_000_000
     try:
         response = requests.request(
             method='POST', url=f'{config.base_url}/v2/orders', headers=_broker_headers(config),
@@ -922,6 +935,12 @@ def _submit_paper_vertical_close(
         )
         response.raise_for_status()
         body = response.json()
+        _record_quant_spread_event(
+            'submit', order, event_ts_ms=submit_started_ms,
+            broker_order_id=str(body.get('id') or '') if isinstance(body, dict) else None,
+            ack_latency_ms=max(0, time.time_ns() // 1_000_000 - submit_started_ms),
+            extra={'broker_status': body.get('status', '') if isinstance(body, dict) else ''},
+        )
         if not isinstance(body, dict) or not body.get('id') or not body.get('status'):
             reconciled = _mleg_submission_result(order, config, body if isinstance(body, dict) else None)
             return {**base_result, **reconciled}
@@ -931,6 +950,11 @@ def _submit_paper_vertical_close(
             return {**base_result, **reconciled}
         return {**base_result, **_mleg_submission_result(order, config, body, reconcile=False)}
     except Exception as exc:
+        _record_quant_spread_event(
+            'submit', order, event_ts_ms=submit_started_ms,
+            ack_latency_ms=max(0, time.time_ns() // 1_000_000 - submit_started_ms),
+            extra={'submission_error': type(exc).__name__},
+        )
         reconciled = _mleg_submission_result(order, config, None, request_error=exc)
         return {**base_result, **reconciled}
 
@@ -1292,6 +1316,7 @@ def _preview_debit_vertical(
             proxy_qty=quantity,
             rejection_code='', rejection_detail='',
         )
+        _record_quant_spread_event('signal', result)
     except Exception:
         result.update(rejection_code='REJECTED_SAFETY_DATA_UNAVAILABLE', rejection_detail='Spread quote or metadata is unavailable or invalid.')
     return result
@@ -1950,6 +1975,26 @@ def _broker_headers(config: TradingConfig) -> dict[str, str]:
     }
 
 
+def _record_quant_spread_event(event: str, order: Any, **kwargs: Any) -> None:
+    try:
+        from .quant.telemetry import record_spread_event, telemetry_enabled
+
+        if telemetry_enabled():
+            record_spread_event(event, order, **kwargs)
+    except Exception:
+        return
+
+
+def _record_quant_broker_fills(orders: Any, config: TradingConfig) -> None:
+    try:
+        from .quant.telemetry import record_broker_fills, telemetry_enabled
+
+        if telemetry_enabled():
+            record_broker_fills(orders, config)
+    except Exception:
+        return
+
+
 def _fetch_alpaca_json(config: TradingConfig, endpoint: str) -> Any:
     try:
         response = _request_with_retries(
@@ -2133,6 +2178,7 @@ def sync_broker_state(config: TradingConfig) -> tuple[pd.DataFrame, pd.DataFrame
                 'spread_reconciliation_status': reconciliation,
             })
         orders = pd.DataFrame(order_rows, columns=order_columns)
+        _record_quant_broker_fills(orders_body, config)
     except Exception:
         orders = pd.DataFrame(columns=order_columns)
 

@@ -16,6 +16,9 @@ build/
 
 # Output data (runtime-generated, not source)
 outputs/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 data/*.csv
 data/*.json
 

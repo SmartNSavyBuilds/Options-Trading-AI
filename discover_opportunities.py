@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.market_data import DEFAULT_TICKERS, fetch_history
+from src.market_data import discovery_tickers, fetch_history
 from src.signal_engine import build_signal_report
 from src.catalyst_scanner import fetch_news_catalysts
 from src.catalyst_events import count_recent_headlines, get_earnings_dates
@@ -113,9 +113,10 @@ def build_catalyst_inputs(signals: pd.DataFrame, config: TradingConfig) -> pd.Da
 
 
 def main() -> None:
-    market_data = fetch_history(DEFAULT_TICKERS, period='6mo', interval='1d')
+    tickers = discovery_tickers()
+    market_data = fetch_history(tickers, period='6mo', interval='1d')
     signals = build_signal_report(market_data)
-    catalysts = fetch_news_catalysts(DEFAULT_TICKERS)
+    catalysts = fetch_news_catalysts(tickers)
     feed = build_discovery_feed(signals, catalysts)
     if not feed.empty:
         feed = feed.merge(build_catalyst_inputs(signals, TradingConfig.from_env()), on='ticker', how='left')

@@ -7,18 +7,23 @@ ensure_project_root_on_path()
 import os
 import re
 import json
+import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
 
 from src.execution import _load_env_file
+from src.iv_history import safety_database_path
 from src.risk_guardrails import apply_exposure_guardrails, build_exposure_summary, build_risk_overview, build_stress_test_table, save_exposure_summary, save_risk_outputs
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / 'outputs'
 OUTPUT_DIR.mkdir(exist_ok=True)
 WIKI_DIR = Path(__file__).resolve().parent / 'wiki'
+DISCOVERY_COOLDOWN_REASONS = {'STALE_QUOTE', 'WIDE_SPREAD', 'NO_MATCHING_SPREAD'}
 
 
 def _extract_underlying_ticker(symbol: str) -> str:
@@ -100,6 +105,215 @@ def load_candidates() -> pd.DataFrame:
         except (OSError, ValueError, pd.errors.ParserError):
             pass
     return df
+
+
+def _discovery_cooldown_minutes() -> int:
+    raw = str(os.getenv('DISCOVERY_COOLDOWN_MINUTES', '20') or '20').strip()
+    try:
+        return max(0, min(int(raw), 24 * 60))
+    except ValueError:
+        return 20
+
+
+def _discovery_top_k(default: int = 3) -> int:
+    raw = str(os.getenv('DISCOVERY_TOP_K', str(default)) or str(default)).strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _discovery_db_path() -> Path:
+    return safety_database_path(OUTPUT_DIR.parent)
+
+
+def _ensure_discovery_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        'CREATE TABLE IF NOT EXISTS discovery_skip_log ('
+        'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+        'logged_at_utc TEXT NOT NULL, '
+        'ticker TEXT NOT NULL, '
+        'reason TEXT NOT NULL, '
+        'detail TEXT NOT NULL, '
+        'source_rejection_code TEXT NOT NULL, '
+        'cooldown_until_utc TEXT NOT NULL)'
+    )
+    connection.execute(
+        'CREATE TABLE IF NOT EXISTS discovery_symbol_cooldowns ('
+        'ticker TEXT PRIMARY KEY, '
+        'reason TEXT NOT NULL, '
+        'detail TEXT NOT NULL, '
+        'cooldown_until_utc TEXT NOT NULL, '
+        'updated_at_utc TEXT NOT NULL)'
+    )
+
+
+def _load_active_cooldown_until(
+    connection: sqlite3.Connection,
+    ticker: str,
+    now_utc: datetime,
+) -> datetime | None:
+    row = connection.execute(
+        'SELECT cooldown_until_utc FROM discovery_symbol_cooldowns WHERE ticker = ?',
+        (ticker,),
+    ).fetchone()
+    if row is None:
+        return None
+    text = str(row[0] or '').strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed if parsed > now_utc else None
+
+
+def _record_discovery_skip(
+    connection: sqlite3.Connection,
+    ticker: str,
+    reason: str,
+    detail: str,
+    source_rejection_code: str,
+    cooldown_until: datetime | None,
+    logged_at_utc: datetime,
+) -> None:
+    cooldown_text = cooldown_until.isoformat() if cooldown_until is not None else ''
+    connection.execute(
+        'INSERT INTO discovery_skip_log '
+        '(logged_at_utc, ticker, reason, detail, source_rejection_code, cooldown_until_utc) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        (
+            logged_at_utc.isoformat(),
+            ticker,
+            reason,
+            detail,
+            source_rejection_code,
+            cooldown_text,
+        ),
+    )
+    if reason in DISCOVERY_COOLDOWN_REASONS and cooldown_until is not None:
+        connection.execute(
+            'INSERT INTO discovery_symbol_cooldowns '
+            '(ticker, reason, detail, cooldown_until_utc, updated_at_utc) '
+            'VALUES (?, ?, ?, ?, ?) '
+            'ON CONFLICT(ticker) DO UPDATE SET '
+            'reason = excluded.reason, detail = excluded.detail, '
+            'cooldown_until_utc = excluded.cooldown_until_utc, updated_at_utc = excluded.updated_at_utc',
+            (ticker, reason, detail, cooldown_text, logged_at_utc.isoformat()),
+        )
+
+
+def _classify_discovery_skip(row: pd.Series) -> tuple[str, str] | None:
+    setup = str(row.get('options_setup', '') or '').strip().lower()
+    if setup == 'insufficient_data':
+        return 'STALE_QUOTE', 'Insufficient discovery data prevented queueing.'
+
+    code = str(row.get('rejection_code', '') or '').strip().upper()
+    detail = str(row.get('rejection_detail', '') or '').strip() or 'Discovery candidate was rejected before queueing.'
+    if code == 'REJECTED_SAFETY_DATA_UNAVAILABLE':
+        return 'STALE_QUOTE', detail
+    if code in {'REJECTED_SPREAD_CONTRACTS', 'REJECTED_SPREAD_EXPIRATION', 'REJECTED_SPREAD_STRIKES'}:
+        return 'NO_MATCHING_SPREAD', detail
+    if code == 'REJECTED_SPREAD_WIDTH':
+        return 'WIDE_SPREAD', detail
+    return None
+
+
+def _apply_discovery_health_gates(candidates: pd.DataFrame) -> pd.DataFrame:
+    if candidates.empty:
+        return candidates
+
+    database = _discovery_db_path()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    survivors: list[dict[str, object]] = []
+    cooldown_minutes = _discovery_cooldown_minutes()
+
+    with closing(sqlite3.connect(database)) as connection, connection:
+        _ensure_discovery_tables(connection)
+        now_utc = datetime.now(timezone.utc)
+        for _, row in candidates.iterrows():
+            ticker = str(row.get('ticker', '') or '').strip().upper()
+            if not ticker:
+                continue
+            active_until = _load_active_cooldown_until(connection, ticker, now_utc)
+            if active_until is not None:
+                _record_discovery_skip(
+                    connection=connection,
+                    ticker=ticker,
+                    reason='COOLDOWN_ACTIVE',
+                    detail=f'Symbol cooldown active until {active_until.isoformat()}.',
+                    source_rejection_code='',
+                    cooldown_until=active_until,
+                    logged_at_utc=now_utc,
+                )
+                continue
+            classified = _classify_discovery_skip(row)
+            if classified is None:
+                survivors.append(row.to_dict())
+                continue
+            reason, detail = classified
+            cooldown_until = now_utc + timedelta(minutes=cooldown_minutes) if cooldown_minutes > 0 and reason in DISCOVERY_COOLDOWN_REASONS else None
+            _record_discovery_skip(
+                connection=connection,
+                ticker=ticker,
+                reason=reason,
+                detail=detail,
+                source_rejection_code=str(row.get('rejection_code', '') or '').strip().upper(),
+                cooldown_until=cooldown_until,
+                logged_at_utc=now_utc,
+            )
+    return pd.DataFrame(survivors, columns=candidates.columns)
+
+
+def _first_numeric(row: pd.Series, columns: list[str]) -> float | None:
+    for column in columns:
+        value = pd.to_numeric(row.get(column), errors='coerce')
+        if pd.notna(value):
+            return float(value)
+    return None
+
+
+def _liquidity_score(row: pd.Series) -> float:
+    spread = _first_numeric(row, ['option_spread_pct', 'bid_ask_spread_pct', 'spread_pct', 'long_leg_spread_pct', 'short_leg_spread_pct'])
+    if spread is None:
+        spread_score = 0.5
+    else:
+        spread_pct = spread / 100.0 if spread > 1 else spread
+        spread_pct = max(0.0, float(spread_pct))
+        spread_score = max(0.0, 1.0 - min(spread_pct / 0.06, 1.0))
+    open_interest = _first_numeric(row, ['open_interest', 'avg_open_interest'])
+    oi_score = min(max(open_interest, 0.0) / 2000.0, 1.0) if open_interest is not None else 0.5
+    return 0.7 * spread_score + 0.3 * oi_score
+
+
+def _iv_alignment_score(row: pd.Series) -> float:
+    iv_rank = _first_numeric(row, ['iv_rank', 'iv_rank_pct', 'implied_volatility_rank'])
+    if iv_rank is None:
+        return 0.5
+    iv_rank = max(0.0, min(float(iv_rank), 100.0))
+    return max(0.0, 1.0 - abs(iv_rank - 50.0) / 50.0)
+
+
+def _signal_strength_score(row: pd.Series) -> float:
+    signal = _first_numeric(row, ['signal_score'])
+    if signal is None:
+        return 0.0
+    return min(abs(signal), 10.0) / 10.0
+
+
+def _composite_opportunity_score(row: pd.Series) -> float:
+    return round(
+        100.0 * (
+            0.45 * _liquidity_score(row)
+            + 0.25 * _iv_alignment_score(row)
+            + 0.30 * _signal_strength_score(row)
+        ),
+        3,
+    )
 
 
 def _append_note(existing: str, note: str) -> str:
@@ -319,7 +533,12 @@ def build_paper_trade_queue(
     max_sector_exposure_pct: float = 100.0,
     max_correlation_bucket_exposure_pct: float = 100.0,
     max_options_exposure_pct: float = 20.0,
+    discovery_top_k: int | None = None,
 ) -> pd.DataFrame:
+    if candidates.empty:
+        return pd.DataFrame()
+
+    candidates = _apply_discovery_health_gates(candidates)
     if candidates.empty:
         return pd.DataFrame()
 
@@ -338,6 +557,7 @@ def build_paper_trade_queue(
             'sector': '', 'correlation_bucket': '', 'asset_family': '',
             'current_sector_exposure_pct': 0.0, 'sector_exposure_after_trade_pct': 0.0,
             'current_bucket_exposure_pct': 0.0, 'bucket_exposure_after_trade_pct': 0.0,
+            'discovery_composite_score': 0.0,
         }
         for column, default in defaults.items():
             if column not in rejected.columns:
@@ -390,6 +610,7 @@ def build_paper_trade_queue(
         'catalyst_reason': '',
         'earnings_dates': '',
         'headline_count_60m': None,
+        'discovery_composite_score': 0.0,
     }.items():
         if column not in queue.columns:
             queue[column] = default
@@ -416,8 +637,16 @@ def build_paper_trade_queue(
             'queue_refreshed_at_utc', 'guardrail_status', 'guardrail_reason',
             'current_name_exposure_pct', 'portfolio_exposure_after_trade_pct',
             'sector', 'correlation_bucket', 'asset_family', 'current_sector_exposure_pct',
-            'sector_exposure_after_trade_pct', 'current_bucket_exposure_pct', 'bucket_exposure_after_trade_pct'
+            'sector_exposure_after_trade_pct', 'current_bucket_exposure_pct', 'bucket_exposure_after_trade_pct',
+            'discovery_composite_score',
         ])
+
+    queue['discovery_composite_score'] = queue.apply(_composite_opportunity_score, axis=1)
+    top_k = _discovery_top_k() if discovery_top_k is None else max(1, int(discovery_top_k))
+    queue = queue.sort_values(
+        ['discovery_composite_score', 'rank_score', 'signal_score', 'projected_return_pct'],
+        ascending=[False, False, False, False],
+    ).head(min(max_positions, top_k)).copy()
 
     queue['broker_route'] = 'alpaca-paper'
     queue['order_status'] = 'queued_for_review'
@@ -431,6 +660,8 @@ def build_paper_trade_queue(
     queue['comment'] = queue.get('guardrail_reason', 'Review bid/ask spread, open interest, and event risk. Change approval_status to approved only after manual review.')
     queue = _preserve_existing_state(queue)
     queue = _apply_discovery_quality_gate(queue)
+    for column in ('rejection_code', 'rejection_detail'):
+        queue[column] = queue[column].astype(object)
     catalyst_blocked = queue['catalyst_status'].fillna('UNKNOWN').astype(str).str.upper().eq('MANUAL_REVIEW_REQUIRED')
     queue.loc[catalyst_blocked, 'approval_status'] = 'hold'
     queue.loc[catalyst_blocked, 'approved_for_submit'] = False
@@ -480,6 +711,7 @@ def build_paper_trade_queue(
             'discovery_quality_status',
             'discovery_quality_formula_version',
             'discovery_quality_gate_reason',
+            'discovery_composite_score',
             'current_name_exposure_pct',
             'portfolio_exposure_after_trade_pct',
             'sector',
@@ -507,6 +739,7 @@ def main() -> None:
     max_sector_exposure_pct = float(os.getenv('MAX_SECTOR_EXPOSURE_PCT', '15') or 15)
     max_correlation_bucket_exposure_pct = float(os.getenv('MAX_CORRELATION_BUCKET_EXPOSURE_PCT', '18') or 18)
     max_options_exposure_pct = float(os.getenv('MAX_OPTIONS_EXPOSURE_PCT', '40') or 40)
+    discovery_top_k = _discovery_top_k()
 
     # Only pass options positions to guardrails — stock holdings don't crowd out options spreads
     options_positions = pd.DataFrame(columns=['symbol', 'market_value'])
@@ -524,6 +757,7 @@ def main() -> None:
         max_sector_exposure_pct=max_sector_exposure_pct,
         max_correlation_bucket_exposure_pct=max_correlation_bucket_exposure_pct,
         max_options_exposure_pct=max_options_exposure_pct,
+        discovery_top_k=discovery_top_k,
     )
     exposure_summary = build_exposure_summary(positions, account_size_usd=account_size_usd)
     risk_overview = build_risk_overview(positions, account_size_usd=account_size_usd)

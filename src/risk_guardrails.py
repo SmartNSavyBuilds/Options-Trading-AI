@@ -12,19 +12,22 @@ ETF_SYMBOLS = {
 CRYPTO_SYMBOLS = {'BTC', 'ETH', 'SOL', 'DOGE', 'XRP'}
 SECTOR_MAP = {
     'AAPL': 'Technology', 'MSFT': 'Technology', 'NVDA': 'Technology', 'AMD': 'Technology', 'AVGO': 'Technology', 'INTC': 'Technology', 'XLK': 'Technology', 'SMH': 'Technology', 'QQQ': 'Technology',
-    'META': 'Communication Services', 'GOOGL': 'Communication Services', 'SNAP': 'Communication Services', 'ROKU': 'Communication Services', 'DIS': 'Communication Services',
+    'META': 'Communication Services', 'GOOGL': 'Communication Services', 'SNAP': 'Communication Services', 'ROKU': 'Communication Services', 'DIS': 'Communication Services', 'NFLX': 'Communication Services',
     'AMZN': 'Consumer Discretionary', 'TSLA': 'Consumer Discretionary', 'UBER': 'Consumer Discretionary', 'XLY': 'Consumer Discretionary',
     'BAC': 'Financials', 'GS': 'Financials', 'JPM': 'Financials', 'PYPL': 'Financials', 'XLF': 'Financials',
-    'UNH': 'Healthcare', 'XLV': 'Healthcare',
+    'UNH': 'Healthcare', 'LLY': 'Healthcare', 'XLV': 'Healthcare',
+    'XOM': 'Energy', 'CVX': 'Energy', 'XLE': 'Energy',
+    'CRM': 'Technology',
     'SPY': 'Broad Market', 'DIA': 'Broad Market', 'IWM': 'Broad Market',
     'BTC': 'Crypto', 'ETH': 'Crypto', 'SOL': 'Crypto', 'DOGE': 'Crypto', 'XRP': 'Crypto',
 }
 CORRELATION_BUCKET_MAP = {
-    'AAPL': 'mega_cap_growth', 'MSFT': 'mega_cap_growth', 'NVDA': 'mega_cap_growth', 'AMD': 'mega_cap_growth', 'AVGO': 'mega_cap_growth', 'META': 'mega_cap_growth', 'GOOGL': 'mega_cap_growth', 'QQQ': 'mega_cap_growth', 'SMH': 'mega_cap_growth', 'XLK': 'mega_cap_growth',
+    'AAPL': 'mega_cap_growth', 'MSFT': 'mega_cap_growth', 'NVDA': 'mega_cap_growth', 'AMD': 'mega_cap_growth', 'AVGO': 'mega_cap_growth', 'META': 'mega_cap_growth', 'GOOGL': 'mega_cap_growth', 'QQQ': 'mega_cap_growth', 'SMH': 'mega_cap_growth', 'XLK': 'mega_cap_growth', 'CRM': 'mega_cap_growth',
     'SPY': 'broad_index_beta', 'DIA': 'broad_index_beta', 'IWM': 'broad_index_beta',
     'BAC': 'financial_beta', 'GS': 'financial_beta', 'JPM': 'financial_beta', 'XLF': 'financial_beta', 'PYPL': 'financial_beta',
-    'UNH': 'defensive_healthcare', 'XLV': 'defensive_healthcare',
-    'AMZN': 'consumer_growth', 'TSLA': 'consumer_growth', 'UBER': 'consumer_growth', 'DIS': 'consumer_growth', 'SNAP': 'consumer_growth', 'ROKU': 'consumer_growth',
+    'UNH': 'defensive_healthcare', 'LLY': 'defensive_healthcare', 'XLV': 'defensive_healthcare',
+    'AMZN': 'consumer_growth', 'TSLA': 'consumer_growth', 'UBER': 'consumer_growth', 'DIS': 'consumer_growth', 'SNAP': 'consumer_growth', 'ROKU': 'consumer_growth', 'NFLX': 'consumer_growth',
+    'XOM': 'commodity_energy', 'CVX': 'commodity_energy', 'XLE': 'commodity_energy',
     'BTC': 'crypto_beta', 'ETH': 'crypto_beta', 'SOL': 'crypto_beta', 'DOGE': 'crypto_beta', 'XRP': 'crypto_beta',
 }
 EXPOSURE_SUMMARY_COLUMNS = [

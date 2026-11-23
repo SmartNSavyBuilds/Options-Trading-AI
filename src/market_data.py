@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import math
+import os
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Sequence
 
 import pandas as pd
 import yfinance as yf
@@ -16,11 +17,19 @@ _OPTION_QUOTE_CACHE_LIMIT = 512
 
 
 DEFAULT_TICKERS = [
-    'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLE', 'XLV', 'SMH',
-    'NVDA', 'AAPL', 'MSFT', 'AMZN', 'META', 'GOOGL', 'AMD', 'TSLA', 'NFLX', 'PLTR',
-    'CRM', 'AVGO', 'JPM', 'BAC', 'GS', 'XOM', 'CVX', 'LLY', 'UNH', 'DIS', 'PYPL',
-    'INTC', 'UBER', 'SNOW', 'ROKU', 'SNAP', 'ACN'
+    'SPY', 'QQQ', 'IWM',
+    'AAPL', 'MSFT', 'NVDA', 'META', 'AMZN', 'GOOGL', 'AMD', 'TSLA',
+    'JPM', 'GS', 'XOM', 'LLY', 'CRM', 'NFLX',
 ]
+
+
+def discovery_tickers(default_tickers: Sequence[str] | None = None) -> list[str]:
+    base = [str(ticker).strip().upper() for ticker in (default_tickers or DEFAULT_TICKERS) if str(ticker).strip()]
+    configured = str(os.getenv('DISCOVERY_UNIVERSE', '') or '').strip()
+    if not configured:
+        return base
+    override = [token.strip().upper() for token in configured.split(',') if token.strip()]
+    return override if override else base
 
 
 def stock_quote_midpoint(client, ticker: str, max_age_seconds: float = 60.0) -> float:

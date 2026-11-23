@@ -1215,6 +1215,22 @@ def _preview_debit_vertical(
         'rejection_code': 'REJECTED_SPREAD_CONTRACTS',
         'rejection_detail': 'Spread metadata or matching option contracts are unavailable.',
     }
+    diagnostics = {
+        'dte_miss': 0,
+        'delta_miss': 0,
+        'liquidity_or_oi_miss': 0,
+        'spread_width_miss': 0,
+    }
+
+    def _contract_rejection_detail(base: str) -> str:
+        return (
+            f'{base} '
+            f"(dte_miss={diagnostics['dte_miss']}, "
+            f"delta_miss={diagnostics['delta_miss']}, "
+            f"liquidity_or_oi_miss={diagnostics['liquidity_or_oi_miss']}, "
+            f"spread_width_miss={diagnostics['spread_width_miss']})."
+        )
+
     try:
         spread_type = str(row.get('spread_type', '')).strip()
         option_type = str(row.get('spread_option_type', '')).strip().lower()
@@ -1225,28 +1241,54 @@ def _preview_debit_vertical(
         expiry_text = str(row.get('expiration_target', '')).strip()
         expiry = pd.to_datetime(expiry_text, format='%Y-%m-%d', errors='coerce')
         if pd.isna(expiry) or expiry.strftime('%Y-%m-%d') != expiry_text:
+            result['rejection_detail'] = _contract_rejection_detail('Spread expiration is missing or invalid.')
             return result
         days = (expiry.normalize() - pd.Timestamp.now().normalize()).days
         if not (21 <= days <= 45) or not all(math.isfinite(value) and value > 0 for value in (long_strike, short_strike)) or ratio != 1:
+            diagnostics['dte_miss'] += int(not (21 <= days <= 45))
+            diagnostics['delta_miss'] += int(not all(math.isfinite(value) and value > 0 for value in (long_strike, short_strike)))
+            result['rejection_detail'] = _contract_rejection_detail('Spread structure values are outside supported limits.')
             return result
         if not ((spread_type == 'bull_call_debit' and option_type == 'call' and bias == 'bullish' and long_strike < short_strike)
                 or (spread_type == 'bear_put_debit' and option_type == 'put' and bias == 'bearish' and long_strike > short_strike)):
+            diagnostics['delta_miss'] += 1
+            result['rejection_detail'] = _contract_rejection_detail('Spread direction and strikes do not match the expected debit-vertical profile.')
             return result
         required = {'symbol', 'underlying_symbol', 'type', 'tradable', 'expiration_date', 'strike_price', 'open_interest'}
         if not required.issubset(contracts.columns):
+            result['rejection_detail'] = _contract_rejection_detail('Spread contract metadata is incomplete.')
             return result
-        eligible = contracts.copy()
-        eligible = eligible[
-            eligible['underlying_symbol'].astype(str).str.upper().eq(underlying)
-            & eligible['type'].astype(str).str.lower().eq(option_type)
-            & eligible['tradable'].eq(True)
-            & pd.to_datetime(eligible['expiration_date'], errors='coerce').dt.strftime('%Y-%m-%d').eq(expiry_text)
-            & pd.to_numeric(eligible['open_interest'], errors='coerce').gt(0)
+
+        base = contracts.copy()
+        base = base[
+            base['underlying_symbol'].astype(str).str.upper().eq(underlying)
+            & base['type'].astype(str).str.lower().eq(option_type)
         ].copy()
+        if base.empty:
+            diagnostics['delta_miss'] += 1
+            result['rejection_detail'] = _contract_rejection_detail('No contracts match the spread option type and underlying.')
+            return result
+        dte_filtered = base[
+            pd.to_datetime(base['expiration_date'], errors='coerce').dt.strftime('%Y-%m-%d').eq(expiry_text)
+        ].copy()
+        diagnostics['dte_miss'] += max(len(base) - len(dte_filtered), 0)
+        if dte_filtered.empty:
+            result['rejection_detail'] = _contract_rejection_detail('No contracts matched the requested expiration.')
+            return result
+        eligible = dte_filtered[
+            dte_filtered['tradable'].eq(True)
+            & pd.to_numeric(dte_filtered['open_interest'], errors='coerce').gt(0)
+        ].copy()
+        diagnostics['liquidity_or_oi_miss'] += max(len(dte_filtered) - len(eligible), 0)
+        if eligible.empty:
+            result['rejection_detail'] = _contract_rejection_detail('No contracts passed tradable/open-interest filters.')
+            return result
         strikes = pd.to_numeric(eligible['strike_price'], errors='coerce')
         long_matches = eligible.loc[strikes.eq(long_strike)]
         short_matches = eligible.loc[strikes.eq(short_strike)]
         if len(long_matches) != 1 or len(short_matches) != 1:
+            diagnostics['delta_miss'] += 1
+            result['rejection_detail'] = _contract_rejection_detail('No unique long/short strike pair matched the candidate spread.')
             return result
         long_symbol = str(long_matches.iloc[0]['symbol']).strip().upper()
         short_symbol = str(short_matches.iloc[0]['symbol']).strip().upper()
@@ -1254,6 +1296,8 @@ def _preview_debit_vertical(
         for symbol, strike in ((long_symbol, long_strike), (short_symbol, short_strike)):
             expected = f"{underlying}{expiry.strftime('%y%m%d')}{suffix}{int(round(strike * 1000)):08d}"
             if not _looks_like_occ_option_symbol(symbol) or symbol != expected or abs(strike * 1000 - round(strike * 1000)) > 1e-8:
+                diagnostics['delta_miss'] += 1
+                result['rejection_detail'] = _contract_rejection_detail('Matched contracts failed OCC symbol normalization checks.')
                 return result
         max_age = float(os.getenv('MAX_QUOTE_AGE_SECONDS', '60'))
         max_spread = float(os.getenv('MAX_OPTION_SPREAD_PCT', '0.06'))
@@ -1262,7 +1306,11 @@ def _preview_debit_vertical(
         long_mid, long_spread, _ = option_snapshot_metrics(option_client, long_symbol, max_age)
         short_mid, short_spread, _ = option_snapshot_metrics(option_client, short_symbol, max_age)
         if long_spread > max_spread or short_spread > max_spread:
-            result.update(rejection_code='REJECTED_SPREAD_WIDTH', rejection_detail='An option leg exceeds the spread-width limit.')
+            diagnostics['spread_width_miss'] += int(long_spread > max_spread) + int(short_spread > max_spread)
+            result.update(
+                rejection_code='REJECTED_SPREAD_WIDTH',
+                rejection_detail=_contract_rejection_detail('An option leg exceeds the spread-width limit.'),
+            )
             return result
         debit = long_mid * (1 + long_spread / 2) - short_mid * (1 - short_spread / 2)
         if not math.isfinite(debit) or debit <= 0 or debit >= abs(short_strike - long_strike):
@@ -1318,7 +1366,10 @@ def _preview_debit_vertical(
         )
         _record_quant_spread_event('signal', result)
     except Exception:
-        result.update(rejection_code='REJECTED_SAFETY_DATA_UNAVAILABLE', rejection_detail='Spread quote or metadata is unavailable or invalid.')
+        result.update(
+            rejection_code='REJECTED_SAFETY_DATA_UNAVAILABLE',
+            rejection_detail='Spread quote or metadata is unavailable or invalid.',
+        )
     return result
 
 

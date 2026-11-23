@@ -102,6 +102,14 @@ def test_stock_quote_midpoint_rejects_stale_and_crossed_quotes() -> None:
         stock_quote_midpoint(FakeClient(quote), 'NVDA')
 
 
+def test_discovery_tickers_supports_env_override(monkeypatch) -> None:
+    from src.market_data import discovery_tickers
+
+    monkeypatch.setenv('DISCOVERY_UNIVERSE', 'spy, qqq , nvda')
+    assert discovery_tickers(['AAPL']) == ['SPY', 'QQQ', 'NVDA']
+    monkeypatch.delenv('DISCOVERY_UNIVERSE', raising=False)
+
+
 def test_candidate_strikes_use_live_midpoint_and_reject_drift(monkeypatch) -> None:
     from types import SimpleNamespace
 
@@ -160,11 +168,7 @@ def test_debit_spread_metadata_survives_queue_and_invalid_expiry_is_held(monkeyp
         assert (row['spread_long_strike'], row['spread_short_strike']) == (100, short_strike)
         assert row['expiration_target'] == target_expiry
         assert row['days_to_expiration'] == 30
-    held = by_ticker.loc['LATE']
-    assert held['spread_type'] == 'bull_call_debit'
-    assert held['rejection_code'] == 'REJECTED_SPREAD_EXPIRATION'
-    assert held['approval_status'] == 'hold'
-    assert not bool(held['approved_for_submit'])
+    assert 'LATE' not in by_ticker.index
 
 
 def test_rejected_candidate_remains_on_hold_in_queue() -> None:
@@ -177,6 +181,178 @@ def test_rejected_candidate_remains_on_hold_in_queue() -> None:
     assert queue.iloc[0]['rejection_code'] == 'REJECTED_INTRADAY_DRIFT'
     assert queue.iloc[0]['approval_status'] == 'hold'
     assert not bool(queue.iloc[0]['approved_for_submit'])
+
+
+def test_build_paper_trade_queue_excludes_stale_quote_candidates(monkeypatch, tmp_path: Path) -> None:
+    import sqlite3
+    from contextlib import closing
+
+    import paper_trade as pt
+
+    outputs_dir = tmp_path / 'outputs'
+    outputs_dir.mkdir()
+    monkeypatch.setattr(pt, 'OUTPUT_DIR', outputs_dir)
+    monkeypatch.setattr(pt, '_preserve_existing_state', lambda queue: queue)
+    monkeypatch.setattr(pt, '_apply_discovery_quality_gate', lambda queue: queue.assign(
+        discovery_quality_score=0.0,
+        discovery_quality_status='unknown',
+        discovery_quality_formula_version='',
+        discovery_quality_gate_reason='',
+    ))
+    candidates = pd.DataFrame(
+        [
+            {
+                'ticker': 'NVDA',
+                'bias': 'bullish',
+                'options_setup': 'Buy 100C',
+                'signal_score': 8,
+                'projected_return_pct': 35.0,
+                'allocation_pct': 1.0,
+                'rank_score': 95.0,
+                'max_risk_usd': 300.0,
+                'rejection_code': '',
+                'rejection_detail': '',
+            },
+            {
+                'ticker': 'SNOW',
+                'bias': 'bullish',
+                'options_setup': 'No trade',
+                'signal_score': 8,
+                'projected_return_pct': 35.0,
+                'allocation_pct': 1.0,
+                'rank_score': 94.0,
+                'max_risk_usd': 300.0,
+                'rejection_code': 'REJECTED_SAFETY_DATA_UNAVAILABLE',
+                'rejection_detail': 'Stock quote is stale or has a future timestamp',
+            },
+        ]
+    )
+
+    queue = pt.build_paper_trade_queue(candidates, existing_tickers=set(), max_positions=5)
+    assert list(queue['ticker']) == ['NVDA']
+
+    with closing(sqlite3.connect(outputs_dir / 'options_safety.sqlite3')) as connection:
+        logged = connection.execute(
+            'SELECT ticker, reason FROM discovery_skip_log WHERE ticker = ? ORDER BY id DESC LIMIT 1',
+            ('SNOW',),
+        ).fetchone()
+    assert logged == ('SNOW', 'STALE_QUOTE')
+
+
+def test_discovery_symbol_cooldown_suppresses_retries(monkeypatch, tmp_path: Path) -> None:
+    import sqlite3
+    from contextlib import closing
+
+    import paper_trade as pt
+
+    outputs_dir = tmp_path / 'outputs'
+    outputs_dir.mkdir()
+    monkeypatch.setattr(pt, 'OUTPUT_DIR', outputs_dir)
+    monkeypatch.setattr(pt, '_preserve_existing_state', lambda queue: queue)
+    monkeypatch.setattr(pt, '_apply_discovery_quality_gate', lambda queue: queue.assign(
+        discovery_quality_score=0.0,
+        discovery_quality_status='unknown',
+        discovery_quality_formula_version='',
+        discovery_quality_gate_reason='',
+    ))
+    monkeypatch.setenv('DISCOVERY_COOLDOWN_MINUTES', '20')
+
+    blocked = pd.DataFrame(
+        [
+            {
+                'ticker': 'TSLA',
+                'bias': 'bullish',
+                'options_setup': 'No trade',
+                'signal_score': 9,
+                'projected_return_pct': 40.0,
+                'allocation_pct': 1.0,
+                'rank_score': 99.0,
+                'max_risk_usd': 500.0,
+                'rejection_code': 'REJECTED_SPREAD_CONTRACTS',
+                'rejection_detail': 'No unique long/short strike pair matched the candidate spread.',
+            }
+        ]
+    )
+    assert pt.build_paper_trade_queue(blocked, existing_tickers=set()).empty
+
+    retried = pd.DataFrame(
+        [
+            {
+                'ticker': 'TSLA',
+                'bias': 'bullish',
+                'options_setup': 'Buy 250C',
+                'signal_score': 9,
+                'projected_return_pct': 40.0,
+                'allocation_pct': 1.0,
+                'rank_score': 99.0,
+                'max_risk_usd': 500.0,
+                'rejection_code': '',
+                'rejection_detail': '',
+            }
+        ]
+    )
+    assert pt.build_paper_trade_queue(retried, existing_tickers=set()).empty
+
+    with closing(sqlite3.connect(outputs_dir / 'options_safety.sqlite3')) as connection:
+        rows = connection.execute(
+            'SELECT reason FROM discovery_skip_log WHERE ticker = ? ORDER BY id',
+            ('TSLA',),
+        ).fetchall()
+    assert [row[0] for row in rows][-2:] == ['NO_MATCHING_SPREAD', 'COOLDOWN_ACTIVE']
+
+
+def test_build_paper_trade_queue_limits_output_to_discovery_top_k(monkeypatch, tmp_path: Path) -> None:
+    import paper_trade as pt
+
+    outputs_dir = tmp_path / 'outputs'
+    outputs_dir.mkdir()
+    monkeypatch.setattr(pt, 'OUTPUT_DIR', outputs_dir)
+    monkeypatch.setattr(pt, '_preserve_existing_state', lambda queue: queue)
+    monkeypatch.setattr(pt, '_apply_discovery_quality_gate', lambda queue: queue.assign(
+        discovery_quality_score=0.0,
+        discovery_quality_status='unknown',
+        discovery_quality_formula_version='',
+        discovery_quality_gate_reason='',
+    ))
+    monkeypatch.setenv('DISCOVERY_TOP_K', '2')
+    candidates = pd.DataFrame(
+        [
+            {'ticker': 'AAPL', 'bias': 'bullish', 'options_setup': 'Buy 200C', 'signal_score': 9, 'projected_return_pct': 32.0,
+             'allocation_pct': 1.0, 'rank_score': 97.0, 'max_risk_usd': 300.0, 'option_spread_pct': 0.02, 'iv_rank': 50.0},
+            {'ticker': 'MSFT', 'bias': 'bullish', 'options_setup': 'Buy 420C', 'signal_score': 7, 'projected_return_pct': 26.0,
+             'allocation_pct': 1.0, 'rank_score': 90.0, 'max_risk_usd': 300.0, 'option_spread_pct': 0.03, 'iv_rank': 48.0},
+            {'ticker': 'NVDA', 'bias': 'bullish', 'options_setup': 'Buy 160C', 'signal_score': 4, 'projected_return_pct': 18.0,
+             'allocation_pct': 1.0, 'rank_score': 85.0, 'max_risk_usd': 300.0, 'option_spread_pct': 0.05, 'iv_rank': 10.0},
+        ]
+    )
+
+    queue = pt.build_paper_trade_queue(candidates, existing_tickers=set(), max_positions=5)
+    assert list(queue['ticker']) == ['AAPL', 'MSFT']
+    assert all(column in queue.columns for column in ['discovery_composite_score'])
+
+
+def test_queue_handles_empty_csv_rejection_columns_for_catalyst_holds(monkeypatch, tmp_path: Path) -> None:
+    import paper_trade
+
+    monkeypatch.setattr(paper_trade, 'OUTPUT_DIR', tmp_path)
+    candidates = pd.DataFrame([
+        {'ticker': 'NVDA', 'bias': 'bullish', 'options_setup': 'Buy 100C',
+         'signal_score': 5, 'projected_return_pct': 10, 'allocation_pct': 1,
+         'rank_score': 5, 'max_risk_usd': 100, 'rejection_code': float('nan'),
+         'rejection_detail': float('nan'), 'catalyst_status': 'MANUAL_REVIEW_REQUIRED',
+         'catalyst_reason': 'Earnings imminent'},
+        {'ticker': 'MSFT', 'bias': 'bullish', 'options_setup': 'Buy 100C',
+         'signal_score': 5, 'projected_return_pct': 10, 'allocation_pct': 1,
+         'rank_score': 4, 'max_risk_usd': 100, 'rejection_code': float('nan'),
+         'rejection_detail': float('nan'), 'catalyst_status': 'CLEAR',
+         'catalyst_reason': float('nan')},
+    ])
+    queue = build_paper_trade_queue(candidates, existing_tickers=set()).set_index('ticker')
+    assert queue.loc['NVDA', 'rejection_code'] == 'REJECTED_CATALYST_BLACKOUT'
+    assert queue.loc['NVDA', 'rejection_detail'] == 'Earnings imminent'
+    assert queue.loc['NVDA', 'approval_status'] == 'hold'
+    assert not bool(queue.loc['NVDA', 'approved_for_submit'])
+    assert pd.isna(queue.loc['MSFT', 'rejection_code'])
 
 
 def test_option_preview_logs_drift_rejection(monkeypatch) -> None:

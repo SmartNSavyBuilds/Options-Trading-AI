@@ -7,16 +7,18 @@ ensure_project_root_on_path()
 import os
 import re
 import json
+import math
 import sqlite3
+import tempfile
 from contextlib import closing
-from datetime import datetime, timezone
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
-from src.execution import _load_env_file
+from src.execution import TradingConfig, _load_env_file, _looks_like_occ_option_symbol, fetch_option_contracts
 from src.iv_history import safety_database_path
+from src.market_data import option_snapshot_metrics, stock_quote_midpoint
 from src.risk_guardrails import apply_exposure_guardrails, build_exposure_summary, build_risk_overview, build_stress_test_table, save_exposure_summary, save_risk_outputs
 
 
@@ -24,6 +26,21 @@ OUTPUT_DIR = Path(__file__).resolve().parent / 'outputs'
 OUTPUT_DIR.mkdir(exist_ok=True)
 WIKI_DIR = Path(__file__).resolve().parent / 'wiki'
 DISCOVERY_COOLDOWN_REASONS = {'STALE_QUOTE', 'WIDE_SPREAD', 'NO_MATCHING_SPREAD'}
+QUEUE_COLUMNS = [
+    'ticker', 'bias', 'signal_close', 'spread_type', 'spread_long_strike', 'spread_short_strike',
+    'spread_option_type', 'spread_ratio_qty', 'expiration_target', 'days_to_expiration',
+    'underlying_midpoint', 'intraday_drift_pct', 'rejection_code', 'rejection_detail',
+    'catalyst_checked_at_utc', 'catalyst_status', 'catalyst_reason', 'earnings_dates',
+    'headline_count_60m', 'options_setup', 'signal_score', 'projected_return_pct', 'max_risk_usd',
+    'allocation_pct', 'broker_route', 'order_status', 'approval_status', 'approved_for_submit',
+    'discovery_quality_override', 'last_submitted_at', 'comment', 'option_order_status',
+    'last_option_submitted_at', 'queue_refreshed_at_utc', 'guardrail_status', 'guardrail_reason',
+    'discovery_quality_score', 'discovery_quality_status', 'discovery_quality_formula_version',
+    'discovery_quality_gate_reason', 'discovery_composite_score', 'current_name_exposure_pct',
+    'portfolio_exposure_after_trade_pct', 'sector', 'correlation_bucket', 'asset_family',
+    'current_sector_exposure_pct', 'sector_exposure_after_trade_pct', 'current_bucket_exposure_pct',
+    'bucket_exposure_after_trade_pct',
+]
 
 
 def _extract_underlying_ticker(symbol: str) -> str:
@@ -267,6 +284,149 @@ def _apply_discovery_health_gates(candidates: pd.DataFrame) -> pd.DataFrame:
                 logged_at_utc=now_utc,
             )
     return pd.DataFrame(survivors, columns=candidates.columns)
+
+
+def _matching_spread_symbols(row: pd.Series, contracts: pd.DataFrame) -> tuple[str, str] | None:
+    ticker = str(row.get('ticker', '')).strip().upper()
+    spread_type = str(row.get('spread_type', '')).strip()
+    option_type = str(row.get('spread_option_type', '')).strip().lower()
+    bias = str(row.get('bias', '')).strip().lower()
+    try:
+        long_strike = float(row.get('spread_long_strike'))
+        short_strike = float(row.get('spread_short_strike'))
+        ratio = float(row.get('spread_ratio_qty'))
+    except (TypeError, ValueError):
+        return None
+    expiry_text = str(row.get('expiration_target', '')).strip()
+    expiry = pd.to_datetime(expiry_text, format='%Y-%m-%d', errors='coerce')
+    if pd.isna(expiry) or expiry.strftime('%Y-%m-%d') != expiry_text:
+        return None
+    days = (expiry.normalize() - pd.Timestamp.now().normalize()).days
+    if not (21 <= days <= 45) or ratio != 1 or not all(
+        math.isfinite(value) and value > 0 for value in (long_strike, short_strike)
+    ):
+        return None
+    if not (
+        (spread_type == 'bull_call_debit' and option_type == 'call' and bias == 'bullish' and long_strike < short_strike)
+        or (spread_type == 'bear_put_debit' and option_type == 'put' and bias == 'bearish' and long_strike > short_strike)
+    ):
+        return None
+    required = {'symbol', 'underlying_symbol', 'type', 'tradable', 'expiration_date', 'strike_price', 'open_interest'}
+    if not required.issubset(contracts.columns):
+        return None
+    eligible = contracts[
+        contracts['underlying_symbol'].astype(str).str.upper().eq(ticker)
+        & contracts['type'].astype(str).str.lower().eq(option_type)
+        & contracts['tradable'].eq(True)
+        & pd.to_datetime(contracts['expiration_date'], errors='coerce').dt.strftime('%Y-%m-%d').eq(expiry_text)
+        & pd.to_numeric(contracts['open_interest'], errors='coerce').gt(0)
+    ]
+    strikes = pd.to_numeric(eligible['strike_price'], errors='coerce')
+    long_matches = eligible.loc[strikes.eq(long_strike)]
+    short_matches = eligible.loc[strikes.eq(short_strike)]
+    if len(long_matches) != 1 or len(short_matches) != 1:
+        return None
+    symbols = (str(long_matches.iloc[0]['symbol']).strip().upper(),
+               str(short_matches.iloc[0]['symbol']).strip().upper())
+    suffix = 'C' if option_type == 'call' else 'P'
+    for symbol, strike in zip(symbols, (long_strike, short_strike)):
+        expected = f"{ticker}{expiry.strftime('%y%m%d')}{suffix}{int(round(strike * 1000)):08d}"
+        if not _looks_like_occ_option_symbol(symbol) or symbol != expected or abs(strike * 1000 - round(strike * 1000)) > 1e-8:
+            return None
+    return symbols
+
+
+def _validate_queue_health(
+    queue: pd.DataFrame,
+    config: TradingConfig,
+    stock_client=None,
+    option_client=None,
+) -> pd.DataFrame:
+    if queue.empty:
+        return queue
+    max_age = float(os.getenv('MAX_QUOTE_AGE_SECONDS', '60'))
+    max_spread = float(os.getenv('MAX_OPTION_SPREAD_PCT', '0.06'))
+    if not math.isfinite(max_age) or max_age <= 0 or not math.isfinite(max_spread) or max_spread < 0:
+        raise ValueError('Invalid discovery quote freshness or spread limit')
+    max_age = min(max_age, 60.0)
+    max_spread = min(max_spread, 0.06)
+
+    if config.trading_mode == 'paper' and config.api_key and config.secret_key:
+        from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
+
+        if stock_client is None:
+            stock_client = StockHistoricalDataClient(config.api_key, config.secret_key)
+        if option_client is None:
+            option_client = OptionHistoricalDataClient(config.api_key, config.secret_key)
+
+    database = _discovery_db_path()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    survivors: list[int] = []
+    with closing(sqlite3.connect(database)) as connection, connection:
+        _ensure_discovery_tables(connection)
+        for index, row in queue.iterrows():
+            ticker = str(row.get('ticker', '')).strip().upper()
+            now = datetime.now(timezone.utc)
+            active_until = _load_active_cooldown_until(connection, ticker, now)
+            if active_until is not None:
+                _record_discovery_skip(connection, ticker, 'COOLDOWN_ACTIVE',
+                                       f'Symbol cooldown active until {active_until.isoformat()}.',
+                                       '', active_until, now)
+                continue
+            reason = ''
+            detail = ''
+            midpoint = None
+            try:
+                if config.trading_mode != 'paper' or stock_client is None or option_client is None:
+                    raise ValueError('Paper market-data clients unavailable')
+                midpoint = stock_quote_midpoint(stock_client, ticker, max_age)
+            except Exception as exc:
+                reason = 'STALE_QUOTE'
+                detail = f'Underlying quote unavailable or invalid ({type(exc).__name__}).'
+
+            if not reason:
+                try:
+                    contracts = fetch_option_contracts(config, ticker, min_days=21, max_days=45, target_strike=midpoint)
+                    symbols = _matching_spread_symbols(row, contracts)
+                except Exception as exc:
+                    symbols = None
+                    detail = f'Spread contract lookup failed ({type(exc).__name__}).'
+                if symbols is None:
+                    reason = 'NO_MATCHING_SPREAD'
+                    detail = detail or 'No eligible contracts match the candidate spread.'
+                else:
+                    try:
+                        spreads = [option_snapshot_metrics(option_client, symbol, max_age)[1] for symbol in symbols]
+                        if any(spread > max_spread for spread in spreads):
+                            reason = 'WIDE_SPREAD'
+                            detail = f'Option leg spread exceeds {max_spread * 100:.2f}%.'
+                    except Exception as exc:
+                        reason = 'STALE_QUOTE'
+                        detail = f'Option leg quote unavailable or invalid ({type(exc).__name__}).'
+            if reason:
+                now = datetime.now(timezone.utc)
+                minutes = _discovery_cooldown_minutes()
+                until = now + timedelta(minutes=minutes) if minutes > 0 else None
+                _record_discovery_skip(connection, ticker, reason, detail, '', until, now)
+            else:
+                survivors.append(index)
+    return queue.loc[survivors].copy()
+
+
+def _write_queue_atomically(queue: pd.DataFrame, path: Path) -> None:
+    output = queue.reindex(columns=QUEUE_COLUMNS) if queue.empty else queue
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='', dir=path.parent,
+                                         prefix='.paper_trade_queue_', suffix='.tmp', delete=False) as handle:
+            temporary_path = Path(handle.name)
+            output.to_csv(handle, index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def _first_numeric(row: pd.Series, columns: list[str]) -> float | None:
@@ -669,60 +829,7 @@ def build_paper_trade_queue(
     queue.loc[catalyst_blocked, 'rejection_detail'] = queue.loc[catalyst_blocked, 'catalyst_reason'].fillna('')
     if not rejected.empty:
         queue = pd.concat([queue, rejected], ignore_index=True)
-    return queue[
-        [
-            'ticker',
-            'bias',
-            'signal_close',
-            'spread_type',
-            'spread_long_strike',
-            'spread_short_strike',
-            'spread_option_type',
-            'spread_ratio_qty',
-            'expiration_target',
-            'days_to_expiration',
-            'underlying_midpoint',
-            'intraday_drift_pct',
-            'rejection_code',
-            'rejection_detail',
-            'catalyst_checked_at_utc',
-            'catalyst_status',
-            'catalyst_reason',
-            'earnings_dates',
-            'headline_count_60m',
-            'options_setup',
-            'signal_score',
-            'projected_return_pct',
-            'max_risk_usd',
-            'allocation_pct',
-            'broker_route',
-            'order_status',
-            'approval_status',
-            'approved_for_submit',
-            'discovery_quality_override',
-            'last_submitted_at',
-            'comment',
-            'option_order_status',
-            'last_option_submitted_at',
-            'queue_refreshed_at_utc',
-            'guardrail_status',
-            'guardrail_reason',
-            'discovery_quality_score',
-            'discovery_quality_status',
-            'discovery_quality_formula_version',
-            'discovery_quality_gate_reason',
-            'discovery_composite_score',
-            'current_name_exposure_pct',
-            'portfolio_exposure_after_trade_pct',
-            'sector',
-            'correlation_bucket',
-            'asset_family',
-            'current_sector_exposure_pct',
-            'sector_exposure_after_trade_pct',
-            'current_bucket_exposure_pct',
-            'bucket_exposure_after_trade_pct',
-        ]
-    ]
+    return queue[QUEUE_COLUMNS]
 
 
 def main() -> None:
@@ -765,12 +872,13 @@ def main() -> None:
     save_exposure_summary(Path(__file__).resolve().parent, exposure_summary)
     save_risk_outputs(Path(__file__).resolve().parent, risk_overview, stress_table)
 
-    if queue.empty:
-        print('No paper-trade candidates passed the risk gate.')
-        return
-
+    queue = _validate_queue_health(queue, TradingConfig.from_env())
     out_file = OUTPUT_DIR / 'paper_trade_queue.csv'
-    queue.to_csv(out_file, index=False)
+    _write_queue_atomically(queue, out_file)
+
+    if queue.empty:
+        print('No paper-trade candidates passed the risk and discovery health gates; queue cleared.')
+        return
 
     print('Paper-trade queue generated:')
     print(out_file)

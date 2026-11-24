@@ -331,6 +331,144 @@ def test_build_paper_trade_queue_limits_output_to_discovery_top_k(monkeypatch, t
     assert all(column in queue.columns for column in ['discovery_composite_score'])
 
 
+def test_queue_cycle_live_checks_and_clears_stale_queue(monkeypatch, tmp_path: Path) -> None:
+    import sqlite3
+    from contextlib import closing
+    from types import SimpleNamespace
+
+    import paper_trade as pt
+
+    outputs = tmp_path / 'outputs'
+    outputs.mkdir()
+    monkeypatch.setattr(pt, 'OUTPUT_DIR', outputs)
+    monkeypatch.setenv('OPTION_SAFETY_DB', str(outputs / 'safety.sqlite3'))
+    monkeypatch.setenv('DISCOVERY_COOLDOWN_MINUTES', '20')
+    monkeypatch.setenv('MAX_QUOTE_AGE_SECONDS', '600')
+    monkeypatch.setenv('MAX_OPTION_SPREAD_PCT', '0.5')
+    monkeypatch.setattr(pt, '_load_env_file', lambda: None)
+    monkeypatch.setattr(pt, 'load_positions_snapshot', lambda: pd.DataFrame())
+    monkeypatch.setattr(pt, 'save_exposure_summary', lambda *args: None)
+    monkeypatch.setattr(pt, 'save_risk_outputs', lambda *args: None)
+    monkeypatch.setattr(pt, '_preserve_existing_state', lambda queue: queue)
+    monkeypatch.setattr(pt, '_apply_discovery_quality_gate', lambda queue: queue.assign(
+        discovery_quality_score=0.0, discovery_quality_status='unknown',
+        discovery_quality_formula_version='', discovery_quality_gate_reason='',
+    ))
+
+    expiry = pd.Timestamp.today().normalize() + pd.Timedelta(days=30)
+    expiry_text = expiry.strftime('%Y-%m-%d')
+    tickers = ['AAPL', 'MSFT', 'NVDA', 'AMD']
+    candidates = pd.DataFrame([
+        {'ticker': ticker, 'bias': 'bullish', 'options_setup': 'Buy 100C / Sell 105C',
+         'spread_type': 'bull_call_debit', 'spread_option_type': 'call', 'spread_long_strike': 100,
+         'spread_short_strike': 105, 'spread_ratio_qty': 1, 'expiration_target': expiry_text,
+         'signal_close': 100, 'signal_score': 8, 'projected_return_pct': 30,
+         'allocation_pct': 1, 'rank_score': 90, 'max_risk_usd': 300}
+        for ticker in tickers
+    ])
+    assert 'rejection_code' not in candidates.columns
+    monkeypatch.setattr(pt, 'load_candidates', lambda: candidates)
+    monkeypatch.setenv('DISCOVERY_TOP_K', '4')
+
+    class StockQuotes:
+        def get_stock_latest_quote(self, request):
+            ticker = request.symbol_or_symbols
+            timestamp = datetime.now(timezone.utc)
+            if ticker == 'AAPL':
+                timestamp -= timedelta(seconds=61)
+            return {ticker: SimpleNamespace(bid_price=99.9, ask_price=100.1, timestamp=timestamp)}
+
+    class OptionQuotes:
+        def get_option_snapshot(self, request):
+            symbol = request.symbol_or_symbols
+            wide = symbol.startswith('NVDA')
+            quote = SimpleNamespace(
+                bid_price=1.0, ask_price=1.2 if wide else 1.02, timestamp=datetime.now(timezone.utc),
+            )
+            return {symbol: SimpleNamespace(latest_quote=quote, implied_volatility=0.3)}
+
+    def contracts(config, ticker, **kwargs):
+        if ticker == 'MSFT':
+            return pd.DataFrame()
+        return pd.DataFrame([
+            {'symbol': f"{ticker}{expiry.strftime('%y%m%d')}C{strike * 1000:08d}",
+             'underlying_symbol': ticker, 'type': 'call', 'tradable': True,
+             'expiration_date': expiry_text, 'strike_price': strike, 'open_interest': 100}
+            for strike in (100, 105)
+        ])
+
+    config = TradingConfig(trading_mode='paper', api_key='test', secret_key='test')
+    monkeypatch.setattr(pt.TradingConfig, 'from_env', lambda: config)
+    monkeypatch.setattr(pt, 'fetch_option_contracts', contracts)
+    validate = pt._validate_queue_health
+    monkeypatch.setattr(pt, '_validate_queue_health', lambda queue, config: validate(
+        queue, config, stock_client=StockQuotes(), option_client=OptionQuotes(),
+    ))
+
+    queue_path = outputs / 'paper_trade_queue.csv'
+    pd.DataFrame([{'ticker': 'OLD'}]).to_csv(queue_path, index=False)
+    pt.main()
+    result = pd.read_csv(queue_path)
+    assert result['ticker'].tolist() == ['AMD']
+    with closing(sqlite3.connect(outputs / 'safety.sqlite3')) as connection:
+        skips = dict(connection.execute('SELECT ticker, reason FROM discovery_skip_log'))
+        cooldowns = dict(connection.execute('SELECT ticker, reason FROM discovery_symbol_cooldowns'))
+    assert skips == {'AAPL': 'STALE_QUOTE', 'MSFT': 'NO_MATCHING_SPREAD', 'NVDA': 'WIDE_SPREAD'}
+    assert cooldowns == skips
+
+    monkeypatch.setattr(pt, 'load_candidates', lambda: candidates.loc[candidates['ticker'].eq('MSFT')])
+    pt.main()
+    result = pd.read_csv(queue_path)
+    assert result.empty
+    assert result.columns.tolist() == pt.QUEUE_COLUMNS
+    with closing(sqlite3.connect(outputs / 'safety.sqlite3')) as connection:
+        assert connection.execute(
+            "SELECT reason FROM discovery_skip_log WHERE ticker = 'MSFT' ORDER BY id DESC LIMIT 1"
+        ).fetchone() == ('COOLDOWN_ACTIVE',)
+    monkeypatch.setattr(pt, 'load_candidates', lambda: pd.DataFrame())
+    pt.main()
+    assert pd.read_csv(queue_path).empty
+    assert not list(outputs.glob('.paper_trade_queue_*.tmp'))
+
+
+def test_queue_live_validation_uses_cooldown_without_requesting_quotes(monkeypatch, tmp_path: Path) -> None:
+    import sqlite3
+    from contextlib import closing
+
+    import paper_trade as pt
+
+    outputs = tmp_path / 'outputs'
+    outputs.mkdir()
+    monkeypatch.setattr(pt, 'OUTPUT_DIR', outputs)
+    monkeypatch.setenv('OPTION_SAFETY_DB', str(outputs / 'safety.sqlite3'))
+    queue = pd.DataFrame([{'ticker': 'NVDA'}])
+    config = TradingConfig(trading_mode='paper')
+    assert pt._validate_queue_health(queue, config).empty
+    monkeypatch.setattr(pt, 'stock_quote_midpoint', lambda *args: (_ for _ in ()).throw(AssertionError('quote requested')))
+    assert pt._validate_queue_health(queue, config, object(), object()).empty
+    with closing(sqlite3.connect(outputs / 'safety.sqlite3')) as connection:
+        reasons = [row[0] for row in connection.execute('SELECT reason FROM discovery_skip_log ORDER BY id')]
+    assert reasons == ['STALE_QUOTE', 'COOLDOWN_ACTIVE']
+
+
+def test_queue_atomic_write_preserves_previous_file_on_replace_failure(monkeypatch, tmp_path: Path) -> None:
+    import pytest
+
+    import paper_trade as pt
+
+    path = tmp_path / 'paper_trade_queue.csv'
+    path.write_text('ticker\nOLD\n', encoding='utf-8')
+
+    def fail_replace(source, target):
+        raise OSError('replace failed')
+
+    monkeypatch.setattr(pt.os, 'replace', fail_replace)
+    with pytest.raises(OSError, match='replace failed'):
+        pt._write_queue_atomically(pd.DataFrame([{'ticker': 'NEW'}]), path)
+    assert path.read_text(encoding='utf-8') == 'ticker\nOLD\n'
+    assert not list(tmp_path.glob('.paper_trade_queue_*.tmp'))
+
+
 def test_queue_handles_empty_csv_rejection_columns_for_catalyst_holds(monkeypatch, tmp_path: Path) -> None:
     import paper_trade
 

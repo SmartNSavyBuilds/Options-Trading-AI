@@ -75,6 +75,15 @@ This launcher always uses `c:\claw-code\.venv\Scripts\python.exe`, which avoids 
 python -m streamlit run dashboard.py --server.port 8502 --server.headless true --server.address 0.0.0.0
 ```
 
+Before writing the paper-trade queue, the queue builder rechecks the underlying
+quote and the candidate's exact debit-vertical contract pair and both option
+quotes. Quotes must be no older than 60 seconds and each option spread must be
+at most 6%; stricter configured limits still apply. Candidates without matching
+spread metadata, including single-leg candidates, are excluded. Skips and symbol
+cooldowns are recorded in the safety SQLite database. An empty cycle atomically
+replaces the queue with a header-only CSV. Execution performs its own independent
+checks again; discovery validation does not authorize or submit orders.
+
 ## Common troubleshooting
 
 1. If Docker daemon is not running:
